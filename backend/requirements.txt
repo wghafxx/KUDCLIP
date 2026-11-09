@@ -1,0 +1,10 @@
+fastapi==0.110.1
+uvicorn[standard]==0.25.0
+python-dotenv>=1.0.0
+pydantic>=2.6.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+yt-dlp[default]>=2026.08.19
+requests
+Pillow>=10
+playwright>=1.55,<2

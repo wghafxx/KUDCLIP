@@ -1,0 +1,124 @@
+@import url('https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;800&family=Manrope:wght@400;500;600;700&family=Russo+One&family=Montserrat:wght@900&family=Rubik:wght@900&display=swap&subset=cyrillic');
+
+
+:root {
+  --cf-bg: #09090B;
+  --cf-surface: #121214;
+  --cf-surface-hover: #1E1E22;
+  --cf-border: #27272A;
+  --cf-cyan: #06B6D4;
+  --cf-violet: #8B5CF6;
+  --cf-pink: #EC4899;
+  --cf-text: #FAFAFA;
+  --cf-text-2: #A1A1AA;
+}
+
+body {
+  background: var(--cf-bg);
+  color: var(--cf-text);
+  font-family: 'Manrope', sans-serif;
+}
+
+.bg-video-wrap { position: fixed; inset: 0; z-index: 0; overflow: hidden; }
+.bg-video { width: 100%; height: 100%; object-fit: cover; }
+.bg-video-overlay { position: absolute; inset: 0; background: rgba(9, 9, 11, 0.55); }
+
+.autopilot-panel { background: linear-gradient(120deg, rgba(6, 182, 212, 0.08), var(--cf-surface) 60%); }
+.publication-video { max-height: 420px; }
+details[open] > summary { margin-bottom: 8px; }
+@media (max-width: 767px) { .publication-video { max-width: 240px; margin-inline: auto; } }
+
+::selection { background: rgba(6, 182, 212, 0.35); color: #fff; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--cf-bg); }
+::-webkit-scrollbar-thumb { background: #2c2c31; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #3d3d44; }
+
+.font-display { font-family: 'Unbounded', sans-serif; }
+
+.glow-text {
+  text-shadow: 0 0 5px rgba(255,255,255,0.8), 0 0 15px var(--glow-color, #06B6D4), 0 0 30px var(--glow-color, #06B6D4);
+}
+
+.cf-card {
+  min-width: 0;
+  background: var(--cf-surface);
+  border: 1px solid var(--cf-border);
+  border-radius: 8px;
+  transition: transform 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
+}
+.cf-card input, .cf-card textarea, .cf-card select { min-width: 0; }
+.cf-card .grid > * { min-width: 0; }
+.cf-card:hover {
+  transform: translateY(-3px);
+  border-color: #3f3f46;
+  box-shadow: 0 8px 30px rgba(139, 92, 246, 0.12);
+}
+
+.neon-btn {
+  background: var(--cf-cyan);
+  color: #062026;
+  font-weight: 700;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+}
+.neon-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 0 24px rgba(6, 182, 212, 0.45);
+  background: #22d3ee;
+}
+
+.ghost-btn {
+  border: 1px solid var(--cf-border);
+  color: var(--cf-text-2);
+  transition: border-color 0.2s ease, color 0.2s ease, background-color 0.2s ease;
+}
+.ghost-btn:hover { border-color: var(--cf-cyan); color: var(--cf-text); background: rgba(6,182,212,0.06); }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; box-shadow: 0 0 8px var(--cf-cyan); }
+  50% { opacity: 0.4; box-shadow: 0 0 2px var(--cf-cyan); }
+}
+.pulse-dot { animation: pulse-dot 1.2s ease-in-out infinite; }
+
+@keyframes trace {
+  0% { background-position: 0% 0%; }
+  100% { background-position: 200% 0%; }
+}
+.tracing-border {
+  position: relative;
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--cf-surface), var(--cf-surface)) padding-box,
+    linear-gradient(90deg, #27272A 0%, #06B6D4 25%, #8B5CF6 50%, #27272A 75%, #27272A 100%) border-box;
+  background-size: 100% 100%, 200% 100%;
+  animation: trace 2.2s linear infinite;
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fade-up 0.45s ease both; }
+
+.progress-glow {
+  background: linear-gradient(90deg, var(--cf-cyan), var(--cf-violet));
+  box-shadow: 0 0 12px rgba(6, 182, 212, 0.5);
+  transition: width 0.6s ease;
+}
+
+.thumb-overlay {
+  background: linear-gradient(to top, rgba(0,0,0,0.85), transparent 55%);
+}
+
+video.enhanced-preview { filter: saturate(1.15) contrast(1.05); }
+
+input[type="color"] {
+  -webkit-appearance: none;
+  border: none;
+  padding: 0;
+  background: none;
+  cursor: pointer;
+}
+input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+input[type="color"]::-webkit-color-swatch { border: 1px solid var(--cf-border); border-radius: 6px; }
