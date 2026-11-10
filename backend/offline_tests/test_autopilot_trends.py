@@ -4,10 +4,11 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from autopilot import Autopilot
+from author_daily import AuthorDaily
 from filedb import Database
 
 
@@ -53,10 +54,11 @@ class TrendSchedulerTests(unittest.IsolatedAsyncioTestCase):
             self.candidate("ccccccccccc", age=48 * 3600, score=100),
             self.candidate("ddddddddddd", speed=None, score=None, status="collecting"),
         ]
+        await self.scheduler.update({"daily_target": 3, "max_source_videos": 3})
         await self.scheduler._tick()
         first = await self.db.jobs.find_one({"id": "aaaaaaaaaaa"})
         self.assertEqual(first["requested"], 3)
-        ids = await self.complete("aaaaaaaaaaa", [94, 80, 88])
+        ids = await self.complete("aaaaaaaaaaa", [94, 70, 88])
         await self.scheduler._tick()
         self.assertEqual((await self.db.jobs.find_one({"id": "bbbbbbbbbbb"}))["requested"], 1)
         extra = await self.complete("bbbbbbbbbbb", [91])
@@ -80,6 +82,76 @@ class TrendSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_v1_target_migrates_but_manual_one_is_kept(self):
         await self.db.app_settings.insert_one({"id": "main", "autopilot": {"daily_target": 1}})
-        self.assertEqual((await self.scheduler.status())["daily_target"], 3)
+        self.assertEqual((await self.scheduler.status())["daily_target"], 6)
         await self.scheduler.update({"daily_target": 1})
         self.assertEqual((await self.scheduler.status())["daily_target"], 1)
+
+    async def test_manual_author_rescan_after_nothing_uses_new_attempt_key(self):
+        daily = AuthorDaily(self.db, self.enqueue, now=lambda: self.now)
+        day = daily._day().date().isoformat()
+        await self.db.author_days.insert_one({"id": f"{day}:profile", "profile_id": "profile", "day": day,
+                                             "status": "nothing", "sources": [{"platform": "youtube", "status": "none"}]})
+        video = {**self.candidate("aaaaaaaaaaa")["video"], "title": "Example", "reason": "Recent", "windows": []}
+        with patch("hype_scout.youtube_pick", new=AsyncMock(return_value=video)) as scan:
+            await daily.run_now()
+            await daily.tick()
+            job = await self.db.jobs.find_one({"id": "aaaaaaaaaaa"})
+            self.assertEqual(job["autopilot_attempt_id"], f"author:{day}:profile:youtube:1")
+            self.assertEqual(scan.await_args.kwargs["exclude"], set())
+            await daily.run_now()
+            await daily.tick()
+            self.assertEqual(scan.await_count, 1)
+
+    async def test_author_recovers_queued_job_after_interrupted_rescan(self):
+        enqueue = AsyncMock()
+        daily = AuthorDaily(self.db, enqueue, now=lambda: self.now)
+        day = daily._day().date().isoformat()
+        await self.db.author_days.insert_one({"id": f"{day}:profile", "profile_id": "profile", "day": day,
+                                             "status": "planning", "started_at": self.now - 60, "scan_attempt": 1,
+                                             "reserve_only": True})
+        video = {**self.candidate("aaaaaaaaaaa")["video"], "title": "Example", "reason": "Recent", "windows": []}
+        await self.db.jobs.insert_one({"id": "saved", "profile_id": "profile", "status": "queued", "source_video": video,
+                                       "autopilot_attempt_id": f"author:{day}:profile:youtube:1"})
+        with patch("hype_scout.youtube_pick", new=AsyncMock()) as scan:
+            await daily.tick()
+            scan.assert_not_awaited()
+        enqueue.assert_not_awaited()
+        report = await self.db.author_days.find_one({"id": f"{day}:profile"})
+        self.assertEqual(report["status"], "processing")
+        self.assertEqual(report["sources"][1]["job_id"], "saved")
+        self.assertTrue(report["reserve_only"])
+
+    async def prepare_author(self, *, reserve_only=False):
+        await self.db.profiles.update_one({"id": "profile"},
+                                          {"$set": {"twitch_channels": ["https://www.twitch.tv/sasavot"]}})
+        daily = AuthorDaily(self.db, self.enqueue, now=lambda: self.now)
+        youtube = {**self.candidate("aaaaaaaaaaa")["video"], "title": "YouTube", "reason": "Recent", "windows": []}
+        twitch = {**youtube, "video_id": "twitchvod:1", "provider": "twitch", "title": "Twitch",
+                  "url": "https://www.twitch.tv/videos/1"}
+        with patch("hype_scout.youtube_pick", new=AsyncMock(return_value=youtube)), \
+                patch("hype_scout.twitch_pick", new=AsyncMock(return_value=twitch)):
+            await daily.run_now(reserve_only=reserve_only)
+            await daily.tick()
+        for video, target in ((youtube, 6), (twitch, 8)):
+            job = await self.db.jobs.find_one({"id": video["video_id"]})
+            self.assertEqual(job["requested"], target)
+            for index in range(target):
+                await self.db.clips.insert_one({"id": f"{video['video_id']}_{index}", "job_id": video["video_id"],
+                                               "ready_for_publish": True, "quality_score": 99 - index})
+            await self.db.jobs.update_one({"id": video["video_id"]}, {"$set": {"status": "done"}})
+        await daily.tick()
+        return (await daily.reports())[0]
+
+    async def test_author_creates_weekly_reserve_without_expanding_autopost(self):
+        report = await self.prepare_author()
+        self.assertEqual(report["status"], "publishing")
+        self.assertEqual([source["prepared_clips"] for source in report["sources"]], [8, 6])
+        self.assertEqual(len(report["releases"]), 4)
+        self.assertEqual(len(report["reserve"]), 10)
+        self.assertTrue(all(entry["quality"] >= 98 for entry in report["releases"]))
+
+    async def test_reserve_only_run_has_no_autopost_entries(self):
+        report = await self.prepare_author(reserve_only=True)
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["releases"], [])
+        self.assertEqual(len(report["reserve"]), 14)

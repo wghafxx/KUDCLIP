@@ -41,7 +41,7 @@ class FreeModelFallbackTests(unittest.IsolatedAsyncioTestCase):
                 fake = AsyncMock(side_effect=[groq_pool.GroqUnavailable(f"Groq HTTP {status}"), response])
                 with patch.object(pipeline, "groq_request", fake), patch.object(
                         pipeline.httpx, "AsyncClient", side_effect=AssertionError("Live HTTP forbidden")):
-                    result = await pipeline.groq_chat_json(object(), [{"role": "user", "content": "Offline"}], models=models)
+                    result = await pipeline._groq_chat_json(object(), [{"role": "user", "content": "Offline"}], models=models)
                 self.assertEqual(result, {"ads": []})
                 self.assertEqual([call.kwargs["json_body"]["model"] for call in fake.await_args_list], models)
                 self.assertTrue(all(model in groq_pool.FREE_LIMITS for model in models))
@@ -57,7 +57,7 @@ class FreeModelFallbackTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(pipeline, "groq_request", fake), patch.object(
                         pipeline.httpx, "AsyncClient", side_effect=AssertionError("Live HTTP forbidden")):
                     with self.assertRaises(type(error)) as caught:
-                        await pipeline.groq_chat_json(object(), [{"role": "user", "content": "Offline"}])
+                        await pipeline._groq_chat_json(object(), [{"role": "user", "content": "Offline"}])
                 self.assertIs(caught.exception, error)
                 self.assertEqual(fake.await_count, 1)
 

@@ -15,9 +15,15 @@ import sys
 import httpx
 import yt_dlp
 import groq_pool
+from jobs import yield_to_quota_waiter
+import gpu_runtime
+import ai_router
+import local_asr
 import editorial
+import face_layout
 import visual_analysis
 import ready_pack
+import stream_analysis
 
 _ytdlp = shutil.which("yt-dlp")
 YTDLP_CMD = [_ytdlp] if _ytdlp else [sys.executable, "-m", "yt_dlp"]
@@ -40,7 +46,7 @@ for d in (RAW_DIR, CLIPS_DIR, ADS_DIR, FONTS_DIR):
 FONT_MAP = {
     "russo": "Russo One",
     "montserrat": "Montserrat Black",
-    "montserrat_italic": "Montserrat Black",
+    "montserrat_italic": "Montserrat Black Italic",
     "rubik": "Rubik Black",
 }
 
@@ -50,6 +56,8 @@ def save_ad_file(filename: str, content: bytes):
 
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GROQ_CHAT_MODELS = ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+GROQ_SCREEN_MODELS = ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b")
+GROQ_REVIEW_MODELS = ("openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b")
 DEFAULT_HASHTAGS = ["#shorts", "#рекомендации", "#топ", "#вирусное", "#интересное"]
 
 
@@ -151,10 +159,11 @@ async def groq_detect_ads(db, segments, duration):
     resp = await groq_chat_json(db, [
         {"role": "system", "content": "Ты определяешь рекламные вставки в видео. Отвечай только валидным JSON."},
         {"role": "user", "content": prompt},
-    ], temperature=0.1, max_tokens=800)
-    parsed = resp
+    ], temperature=0.1, max_tokens=800, models=GROQ_SCREEN_MODELS)
+    if not isinstance(resp.get('ads'), list):
+        raise RuntimeError('ИИ не вернул список рекламных интервалов; этап не сохранён')
     out = []
-    for a in parsed.get("ads", []):
+    for a in resp['ads']:
         try:
             s, e = float(a.get("start", 0)), float(a.get("end", 0))
         except (TypeError, ValueError):
@@ -196,17 +205,38 @@ async def groq_request(db, path, *, data=None, files=None, json_body=None, audio
 
 
 async def groq_chat_json(db, messages, temperature=0.3, max_tokens=1500, models=None):
+    return await ai_router.chat_json(db, messages, temperature, max_tokens,
+                                     groq_fallback=lambda: _groq_chat_json(db, messages, temperature, max_tokens, models))
+
+
+async def needs_groq(db):
+    name, config = await ai_router.provider(db)
+    local = config['asr'] == 'local' or (config['asr'] == 'auto' and local_asr.available())
+    return name == 'groq' or not local
+
+
+async def _groq_chat_json(db, messages, temperature=0.3, max_tokens=1500, models=None):
     """Чат-запрос с фолбэком по моделям: недоступная модель не считается проблемой ключа."""
-    last = None
-    for model in (models or GROQ_CHAT_MODELS):
+    last, deferred = None, []
+    order = models or GROQ_CHAT_MODELS
+    for model in order:
         try:
-            resp = await groq_request(db, "/chat/completions", json_body={
+            reasoning = {"reasoning_effort": "low", "include_reasoning": False} if model.startswith('openai/gpt-oss-') else {}
+            output_budget = min(max_tokens, 900) if model == 'qwen/qwen3.8-27b' else max_tokens
+            payload = {
                 "model": model,
                 "temperature": temperature,
-                "max_tokens": max_tokens,
+                "max_tokens": output_budget,
                 "response_format": {"type": "json_object"},
                 "messages": messages,
-            })
+                **reasoning,
+            }
+            try:
+                resp = await groq_request(db, "/chat/completions", json_body=payload)
+            except groq_pool.GroqOutputLimit as exc:
+                if not 0 < exc.limit < output_budget:
+                    raise
+                resp = await groq_request(db, "/chat/completions", json_body={**payload, 'max_tokens': exc.limit})
             result = json.loads(resp["choices"][0]["message"]["content"])
             if not isinstance(result, dict):
                 raise RuntimeError('ИИ вернул неверный формат анализа; повторите задачу')
@@ -214,14 +244,18 @@ async def groq_chat_json(db, messages, temperature=0.3, max_tokens=1500, models=
         except GroqModelUnavailable as e:
             last = str(e)[:120]
             logger.warning(f"Groq модель {model} недоступна, пробую следующую: {last}")
-        except groq_pool.GroqDeferred:
-            raise
+        except groq_pool.GroqDeferred as exc:
+            if models is None:
+                raise
+            deferred.append(exc)
         except groq_pool.GroqUnavailable as exc:
-            if re.search(r'HTTP 50[234]', str(exc)) and model != (models or GROQ_CHAT_MODELS)[-1]:
+            if re.search(r'HTTP 50[234]', str(exc)) and model != order[-1]:
                 last = str(exc)[:120]
                 logger.warning('Groq временно не обслуживает модель %s; проверяю следующую разрешённую бесплатную модель', model)
                 continue
             raise
+    if deferred:
+        raise min(deferred, key=lambda exc: exc.retry_at)
     raise RuntimeError(f"Groq: нет доступной chat-модели ({last})")
 
 
@@ -241,7 +275,11 @@ def _sanitize_words(words):
     return out
 
 
-async def groq_transcribe(db, audio_path: Path, audio_seconds: float):
+async def groq_transcribe(db, audio_path: Path, audio_seconds: float, *, local_only=False):
+    config = await ai_router.settings(db)
+    if local_only or config['asr'] == 'local' or (config['asr'] == 'auto' and local_asr.available()):
+        words, segments, text = await local_asr.transcribe(audio_path, config['whisper_model'])
+        return _sanitize_words(words), segments, text
     data = {
         "model": "whisper-large-v3",
         "response_format": "verbose_json",
@@ -371,6 +409,12 @@ async def list_channel_videos(channel_url: str, limit: int = 30):
 
 
 async def _run(cmd: list, timeout: int = 600):
+    if cmd[0] == 'ffmpeg' and 'libx264' in cmd:
+        return await gpu_runtime.encode(_run_command, cmd, timeout)
+    return await _run_command(cmd, timeout)
+
+
+async def _run_command(cmd: list, timeout: int = 600):
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         **({'creationflags': 0x08000000} if os.name == 'nt' else {})
@@ -410,13 +454,57 @@ def _get_video_duration_sync(url: str) -> float:
     return float(info.get("duration") or 0)
 
 
-async def download_segment(video_url: str, start: float, end: float, out_path: Path):
+async def _twitch_window(video_url, start, end, out_path, *, precise=False):
+    """Fetch only the HLS segments that cover [start, end]; ffmpeg seeking over Twitch HLS is very slow."""
+    playlist_url = (await _run([*YTDLP_CMD, '-g', '-f', 'best[height<=1080]/best', video_url], timeout=120)).strip().splitlines()[-1]
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        manifest = await client.get(playlist_url)
+        manifest.raise_for_status()
+        text = manifest.text
+        segments, at, duration, init = [], 0.0, None, None
+        for line in text.splitlines():
+            if line.startswith('#EXT-X-MAP:') and 'URI="' in line:
+                init = httpx.URL(playlist_url).join(line.split('URI="', 1)[1].split('"', 1)[0])
+            elif line.startswith('#EXTINF:'):
+                duration = float(line[8:].split(',')[0])
+            elif line and not line.startswith('#') and duration is not None:
+                if at + duration > start and at < end:
+                    segments.append((at, httpx.URL(playlist_url).join(line)))
+                at, duration = at + duration, None
+        if not segments:
+            raise RuntimeError('В записи стрима нет нужного отрезка')
+        gate = asyncio.Semaphore(6)
+
+        async def fetch(url):
+            async with gate:
+                response = await client.get(url)
+                response.raise_for_status()
+                return response.content
+
+        chunks = await asyncio.gather(*(fetch(url) for url in ([init] if init else []) + [u for _, u in segments]))
+    joined = out_path.with_name(out_path.stem + ('.frag.mp4' if init else '.ts'))
+    joined.write_bytes(b''.join(chunks))
+    encoding = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-c:a', 'aac'] if precise else ['-c', 'copy']
+    try:
+        await _run(['ffmpeg', '-y', '-ss', f'{start - segments[0][0]:.3f}', '-i', str(joined), '-t', f'{end - start:.3f}',
+                    '-map', '0:v:0', '-map', '0:a?', *encoding, str(out_path)], timeout=300)
+    finally:
+        joined.unlink(missing_ok=True)
+
+
+async def download_segment(video_url: str, start: float, end: float, out_path: Path, precise=True):
     pending = out_path.with_name(out_path.stem + '.download.mp4')
     pending.unlink(missing_ok=True)
-    if isinstance(video_url, Path):
+    if isinstance(video_url, str) and re.search(r'twitch\.tv/videos/\d+', video_url):
+        await _twitch_window(video_url, start, end, pending, precise=precise)
+        if not precise:
+            pending.replace(out_path)
+            return
+    elif isinstance(video_url, Path):
         cmd = ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", str(video_url),
                "-t", f"{end - start:.3f}", "-map", "0:v:0", "-map", "0:a?",
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "aac", str(pending)]
+        await _run(cmd, timeout=600)
     else:
         cmd = [
             *YTDLP_CMD, *YTDLP_ARGS,
@@ -424,12 +512,12 @@ async def download_segment(video_url: str, start: float, end: float, out_path: P
             "-S", "res:2160,fps,vcodec:h264,acodec:m4a",
             "--merge-output-format", "mp4",
             "--download-sections", f"*{start:.3f}-{end:.3f}",
-            "--force-keyframes-at-cuts",
+            *(["--force-keyframes-at-cuts"] if precise else ["-S", "res:1080,fps"]),
             "--no-playlist",
             "-o", str(pending),
             video_url,
         ]
-    await _run(cmd, timeout=600)
+        await _run(cmd, timeout=600)
     if not pending.exists():
         cands = [p for p in pending.parent.glob(pending.stem + '.*') if p.suffix.lower() in {'.mp4', '.mkv', '.webm', '.mov'}]
         if not cands:
@@ -445,7 +533,7 @@ async def download_segment(video_url: str, start: float, end: float, out_path: P
     pending.replace(out_path)
 
 
-async def download_full_audio(video_url: str, out_path: Path):
+async def download_full_audio(video_url: str, out_path: Path, *, expected_duration=None):
     if isinstance(video_url, Path):
         if not any(stream.get("codec_type") == "audio" for stream in (await _probe(video_url)).get("streams", [])):
             return False
@@ -454,21 +542,29 @@ async def download_full_audio(video_url: str, out_path: Path):
         pending.replace(out_path)
         return True
     tmp = out_path.with_suffix(".src.m4a")
-    cmd = [*YTDLP_CMD, *YTDLP_ARGS, "-f", "ba/b", "--no-playlist", "-o", str(tmp), video_url]
-    await _run(cmd, timeout=900)
+    # Long jobs only need audio. A fallback to a combined seven-hour video
+    # could download tens of gigabytes and fill the system disk.
+    long_source = expected_duration is not None
+    strict_fragments = ['--abort-on-unavailable-fragments'] if long_source else []
+    cmd = [*YTDLP_CMD, *YTDLP_ARGS, "-f", "ba" if long_source else "ba/b", *strict_fragments,
+           "--no-playlist", "-o", str(tmp), video_url]
+    await _run(cmd, timeout=2400 if long_source else 900)
     if not tmp.exists():
         cands = list(tmp.parent.glob(tmp.stem + ".*"))
         if not cands:
             raise RuntimeError("Аудио не скачалось")
         tmp = cands[0]
     metadata = await _probe(tmp)
+    if long_source and float(metadata.get('format', {}).get('duration') or 0) < expected_duration - 5:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError('Аудио длинного исходника скачалось не полностью; повторите задачу')
     if not any(s.get('codec_type') == 'audio' for s in metadata.get('streams', [])):
         tmp.unlink(missing_ok=True)
         return False
     encoded = out_path.with_name(out_path.stem + '.pending.mp3')
     await _run(["ffmpeg", "-y", "-i", str(tmp), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", str(encoded)], timeout=600)
     tmp.unlink(missing_ok=True)
-    if encoded.stat().st_size > 24 * 1024 * 1024:
+    if not long_source and encoded.stat().st_size > 24 * 1024 * 1024:
         small = out_path.with_suffix(".16k.mp3")
         await _run(["ffmpeg", "-y", "-i", str(encoded), "-ac", "1", "-b:a", "16k", str(small)], timeout=600)
         small.replace(encoded)
@@ -525,15 +621,29 @@ def _group_words(words, max_chars=16, max_words=3, max_gap=0.6):
     return phrases
 
 
-def build_ass(words, font_key: str, glow_hex: str, offset: float = 0.0, *, split=False) -> str:
-    font = FONT_MAP.get(font_key, "Russo One")
+SUB_POSITIONS = {"bottom": (2, 355), "middle": (5, 0), "top": (8, 300)}
+
+
+def subtitle_style(settings):
+    return {"glow": bool(settings.get("sub_glow", False)), "size": int(settings.get("sub_size", 55)),
+            "color": settings.get("sub_color", "#FFFFFF"), "position": settings.get("sub_position", "bottom"),
+            "uppercase": bool(settings.get("sub_uppercase", False)), "words": int(settings.get("sub_words", 3)),
+            "animate": bool(settings.get("sub_animate", False)), "outline": int(settings.get("sub_outline", 4))}
+
+
+def build_ass(words, font_key: str, glow_hex: str, offset: float = 0.0, *, split=False, style=None, duration=None) -> str:
+    style = {**subtitle_style({}), **(style or {})}
+    font = FONT_MAP.get(font_key, "Montserrat Black")
     italic = -1 if font_key == "montserrat_italic" else 0
-    clean = font_key == "montserrat_italic"
-    glow = "&H00000000&" if clean else _hex_to_ass(glow_hex)
-    font_size = 70 if clean else 92
-    margin = 570 if split else 355
-    outline = 5 if clean else 4
+    clean = not style["glow"]
+    glow = _hex_to_ass(glow_hex).rstrip("&")
+    font_size = max(40, min(140, style["size"]))
+    alignment, margin = SUB_POSITIONS.get(style["position"], SUB_POSITIONS["bottom"])
+    if split and alignment == 2:
+        margin = 570
+    outline = max(0, min(12, style["outline"]))
     shadow = 2 if clean else 0
+    primary = _hex_to_ass(style["color"]).rstrip("&")
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -543,55 +653,71 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Word,{font},{font_size},&H00FFFFFF,&H00FFFFFF,{glow},&H78000000,-1,{italic},0,0,100,100,0,0,1,{outline},{shadow},2,100,145,{margin},1
-Style: GlowBg,{font},92,{glow},{glow},{glow},&H00000000,-1,{italic},0,0,100,100,1,0,1,10,0,2,60,60,340,1
+Style: Word,{font},{font_size},{primary},{primary},&H00000000,&H78000000,-1,{italic},0,0,100,100,0,0,1,{outline},{shadow},{alignment},100,100,{margin},1
+Style: GlowBg,{font},{font_size},{glow},{glow},{glow},&H00000000,-1,{italic},0,0,100,100,0,0,1,{outline + 8},0,{alignment},100,100,{margin},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-    # собираем фразы с таймингами, затем жёстко устраняем наложения:
-    # конец фразы всегда раньше начала следующей — текст никогда не лежит на тексте
+    # Keep speech starts fixed. A close cue shortens the preceding tail; it
+    # must not delay the next word or create an artificial blank frame.
     events = []
-    for phrase in _group_words(words, max_chars=23 if clean else 16, max_words=4 if clean else 3):
-        start = phrase[0]["start"] - offset
+    per_line = max(1, min(6, style["words"]))
+    for phrase in _group_words(words, max_chars=6 + per_line * 5, max_words=per_line):
+        start = max(0.0, phrase[0]["start"] - offset)
         end = phrase[-1]["end"] - offset + 0.35
-        if end <= 0:
+        if duration is not None:
+            end = min(duration, end)
+        if end <= start:
             continue
         text = " ".join(w["word"].strip() for w in phrase)
-        if not clean:
+        if style["uppercase"]:
             text = text.upper()
         text = text.replace("{", "").replace("}", "").replace("\\", "")
         if not text.strip():
             continue
-        events.append([max(0.0, start), end, text])
-    for i in range(len(events) - 1):
-        next_start = events[i + 1][0]
-        if events[i][1] > next_start - 0.04:
-            events[i][1] = max(events[i][0] + 0.20, next_start - 0.04)
-        if events[i + 1][0] < events[i][1]:
-            events[i + 1][0] = events[i][1] + 0.01
+        if events and start - events[-1][0] < 1 / 30:
+            events[-1][1] = max(events[-1][1], end)
+            events[-1][2] += ' ' + text
+        else:
+            events.append([start, end, text])
     lines = []
-    for start, end, text in events:
-        if end <= start:
-            continue
-        if clean:
-            lines.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Word,,0,0,0,,{text}")
-            continue
-        if end - start < 0.12:
-            end = start + 0.12
+    for index, (start, end, text) in enumerate(events):
+        if index + 1 < len(events):
+            end = min(end, events[index + 1][0])
         st, et = _ass_time(start), _ass_time(end)
-        anim = r"{\fad(100,60)\fscx70\fscy70\t(0,140,\fscx108\fscy108)\t(140,240,\fscx100\fscy100)"
-        lines.append(f"Dialogue: 0,{st},{et},GlowBg,,0,0,0,,{anim}\\blur16}}{text}")
-        lines.append(f"Dialogue: 1,{st},{et},Word,,0,0,0,,{anim}\\blur0.6}}{text}")
+        if st == et:
+            continue
+        anim = r"\fad(100,60)\fscx70\fscy70\t(0,140,\fscx108\fscy108)\t(140,240,\fscx100\fscy100)" if style["animate"] and end - start >= 0.24 else ""
+        if not clean:
+            lines.append(f"Dialogue: 0,{st},{et},GlowBg,,0,0,0,,{{{anim}\\blur14}}{text}")
+        lines.append(f"Dialogue: 1,{st},{et},Word,,0,0,0,,{{{anim}\\blur0.6}}{text}")
     return header + "\n".join(lines) + "\n"
 
 
 # ================= Rendering =================
-async def render_clip(raw_path: Path, ass_path: Path, out_path: Path, saturation: float, background: str = "blur", crop_x: float = 0.5, *, banner=None, loop=None, hook=False, duration=None):
+BANNER_Y = {"top": "180", "middle": "(H-h)/2", "bottom": "H-h-180", "above_subs": "H-h-640"}
+
+
+def _banner_spot(settings):
+    # Never cover the subtitles: move the banner out of their way.
+    banner, subs = settings.get('banner_position', 'top'), settings.get('sub_position', 'bottom')
+    if banner == 'top' and settings.get('title_banner', True):
+        banner = 'bottom' if subs == 'middle' else 'middle'
+    if banner == subs == 'bottom':
+        return 'above_subs'
+    return 'top' if banner == subs else banner
+
+
+async def render_clip(raw_path: Path, ass_path: Path, out_path: Path, saturation: float, background: str = "blur", crop_x: float = 0.5, *, banner=None, loop=None, hook=False, duration=None, banner_style=None, portrait=None):
+    banner_style = banner_style or {}
     ass_arg = ass_path.as_posix().replace(":", r"\:")
     fonts_arg = FONTS_DIR.as_posix().replace(":", r"\:")
     inputs = ["-i", str(raw_path)]
-    if loop:
+    if portrait:
+        loop = None
+        chain = face_layout.filter_graph(portrait, saturation)
+    elif loop:
         inputs += ["-stream_loop", "-1", "-i", str(loop)]
         chain = (
             "[0:v]split[bg0][fg0];"
@@ -630,9 +756,14 @@ async def render_clip(raw_path: Path, ass_path: Path, out_path: Path, saturation
         index = 2 if loop else 1
         inputs += ["-i", str(banner)]
         show_from = min(5.0, max(1.5, duration / 3))
-        show_until = min(duration - 0.2, show_from + 3.5)
-        chain += (f"[picture];[{index}:v]scale=720:145:force_original_aspect_ratio=decrease,format=rgba[ad];"
-                  f"[picture][ad]overlay=(W-w)/2:180:enable='between(t,{show_from:.2f},{show_until:.2f})'")
+        show_until = min(duration - 0.2, show_from + float(banner_style.get("seconds", 3.5)))
+        width = int(1080 * max(0.3, min(1.0, float(banner_style.get("scale", 0.67))))) // 2 * 2
+        y = (face_layout.BANNER_Y.get(banner_style.get("position"), "1104") if portrait
+             else BANNER_Y.get(banner_style.get("position"), "180"))
+        scale = f"{width}:300:force_original_aspect_ratio=decrease:force_divisible_by=2" if portrait else f"{width}:-2"
+        enable = "" if banner_style.get("mode") == "always" else f":enable='between(t,{show_from:.2f},{show_until:.2f})'"
+        chain += (f"[picture];[{index}:v]scale={scale},format=rgba[ad];"
+                  f"[picture][ad]overlay=(W-w)/2:'{y}'{enable}")
     if ass_path.exists():
         chain += f",ass='{ass_arg}':fontsdir='{fonts_arg}'"
     chain += "[outv]"
@@ -807,40 +938,58 @@ def _analysis_id(url):
     return hashlib.sha256(identity.encode()).hexdigest()[:24]
 
 
-async def _transcript(db, video_url, duration, analysis, persist, folder):
+async def _transcript(db, video_url, duration, analysis, persist, folder, *, long_source=False, upd=None, job=None):
     if analysis.get('transcript_version') == 1:
+        if long_source and analysis.get('transcript_parts'):
+            analysis['transcript_parts'] = {}
+            await persist()
         return analysis.get('words', []), analysis.get('segments', [])
     audio = folder / 'full.mp3'
     if not audio.exists():
-        has_audio = await download_full_audio(video_url, audio)
+        options = {'expected_duration': duration} if long_source else {}
+        has_audio = await download_full_audio(video_url, audio, **options)
         if has_audio is False:
             analysis.update(words=[], segments=[], transcript_version=1, sound_peaks=[])
             await persist()
             return [], []
     parts = analysis.setdefault('transcript_parts', {})
     all_words, all_segments = [], []
-    # Small resumable requests avoid repeating a full transcription after a quota
-    # wait and fit the hourly free audio budget even for longer source files.
-    for index, start in enumerate(range(0, int(duration + 0.999), 1200)):
-        key = str(index)
+    # Small resumable chunks bound memory and allow the GPU to check its
+    # temperature frequently. Existing short-source caches use 20-minute parts.
+    chunk_seconds = 300 if long_source else 1200
+    starts = range(0, int(duration + 0.999), chunk_seconds)
+    for index, start in enumerate(starts):
+        seconds = min(chunk_seconds, duration - start)
+        key = f'{start}:{seconds:.3f}' if long_source else str(index)
         if key not in parts:
+            if upd is not None:
+                await upd(progress=8 + int(7 * index / len(starts)),
+                          status_text=f'Распознавание речи по всему исходнику: часть {index + 1}/{len(starts)}…')
             part = folder / f'audio_{index}.mp3'
-            seconds = min(1200, duration - start)
             await _run(['ffmpeg', '-y', '-ss', str(start), '-i', str(audio), '-t', str(seconds),
                         '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', str(part)], timeout=180)
-            words, segments, _ = await groq_transcribe(db, part, seconds)
+            if long_source:
+                words, segments, _ = await groq_transcribe(db, part, seconds, local_only=True)
+            else:
+                words, segments, _ = await groq_transcribe(db, part, seconds)
             parts[key] = {
                 'words': [{**w, 'start': w['start'] + start, 'end': w['end'] + start} for w in words],
                 'segments': [{**s, 'start': s['start'] + start, 'end': s['end'] + start} for s in segments],
             }
             await persist()
             part.unlink(missing_ok=True)
+            if job is not None:
+                await yield_to_quota_waiter(db, job)
         all_words.extend(parts[key]['words'])
         all_segments.extend(parts[key]['segments'])
     analysis.update(words=_sanitize_words(all_words), segments=all_segments, transcript_version=1)
     # Reuse this audio for local energy analysis, then keep only compact cached
     # transcript/observations; a quota pause leaves the source available.
-    if 'sound_peaks' not in analysis:
+    if long_source:
+        # The uncompressed PCM needed for a seven-hour peak scan could take
+        # hundreds of MB; the transcript and platform cues cover this pass.
+        analysis['transcript_parts'] = {}
+    elif 'sound_peaks' not in analysis:
         analysis['sound_peaks'] = await visual_analysis.sound_peaks(audio)
     await persist()
     audio.unlink(missing_ok=True)
@@ -962,7 +1111,8 @@ async def publication_metadata(moment, words, stages, save, chat):
     source = ' '.join(w['word'] for w in words if moment['start'] <= w['start'] < moment['end'])
     facts = {key: moment.get(key) for key in ('title', 'hook', 'payoff', 'selection_reason', 'visual_reason', 'context_line')}
     key = 'publication-v2:' + hashlib.sha256(json.dumps(facts, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:20]
-    if key not in stages:
+    cached = stages.get(key)
+    if not isinstance(cached, dict) or not str(cached.get('caption') or '').strip():
         excerpt = source if len(source) <= 1800 else source[:600] + '\n[…]\n' + source[-1200:]
         prompt = ('Напиши подпись для одного короткого видео на русском. '
                   'Нельзя придумывать результат, число, ставку, обещание или чужие слова. '
@@ -1018,17 +1168,17 @@ async def choose_final(moments, words, stages, save, chat, count):
 
     key = 'final-v2:' + hashlib.sha256(json.dumps(messages, ensure_ascii=False).encode()).hexdigest()[:20]
     result = stages.get(key)
-    if key not in stages:
+    def valid_ranking(response):
+        ranking = response.get('ranking') if isinstance(response, dict) else None
+        return (isinstance(ranking, list) and len(ranking) == len(moments)
+                and all(type(index) is int for index in ranking) and set(ranking) == set(range(len(moments))))
+    if not valid_ranking(result):
         result = await chat(messages, temperature=0.1, max_tokens=250)
-    ranking = result.get('ranking') if isinstance(result, dict) else None
-    if (not isinstance(ranking, list) or len(ranking) != len(moments)
-            or any(type(index) is not int for index in ranking)
-            or set(ranking) != set(range(len(moments)))):
-        raise RuntimeError('Сравнение финалистов вернуло некорректный результат')
-    if key not in stages:
+        if not valid_ranking(result):
+            raise RuntimeError('Сравнение финалистов вернуло некорректный результат; этап не сохранён')
         stages[key] = result
         await save(key, result)
-    return [moments[index] for index in ranking[:count]]
+    return [moments[index] for index in result['ranking'][:count]]
 
 
 _DELIVERY_LOCKS = {}
@@ -1085,14 +1235,10 @@ async def _deliver_clip_locked(db, clip, recipients, *, force=False, check=None)
     return delivered_now, errors
 
 
-async def _inspect_material(db, video_url, source_identity, duration, offset, job, settings,
-                            manual, wanted, trend_mode, folder, analysis, persist, stages,
-                            save, chat, vision, upd):
-    await upd(status='transcribing', progress=8, status_text='Распознавание речи; готовые части используются повторно…')
-    full_words, segments = await _transcript(db, video_url, duration, analysis, persist, folder)
-    if source_identity.startswith('twitch:'):
-        banned, highlights = [], []
-    elif 'sponsorblock' not in analysis:
+async def _source_markers(source_identity, duration, offset, analysis, persist):
+    if source_identity.startswith(('twitch:', 'twitchvod:')):
+        return [], []
+    if 'sponsorblock' not in analysis:
         try:
             banned, highlights = await sponsorblock_segments(source_identity)
             if offset is not None:
@@ -1106,13 +1252,26 @@ async def _inspect_material(db, video_url, source_identity, duration, offset, jo
     else:
         banned = analysis['sponsorblock']['banned']
         highlights = analysis['sponsorblock']['highlights']
+    return banned, highlights
+
+
+async def _inspect_material(db, video_url, source_identity, duration, offset, job, settings,
+                            manual, wanted, trend_mode, folder, analysis, persist, stages,
+                            save, chat, vision, upd, *, prepared=None):
+    if prepared is None:
+        await upd(status='transcribing', progress=8, status_text='Распознавание речи; готовые части используются повторно…')
+        full_words, segments = await _transcript(db, video_url, duration, analysis, persist, folder)
+    else:
+        full_words, segments = prepared
+    banned, highlights = await _source_markers(source_identity, duration, offset, analysis, persist)
     await upd(status='analyzing', progress=16, status_text='Проверка всего транскрипта на рекламные фрагменты…')
     banned = _merge_intervals(list(banned) + await _all_ads(db, segments, duration, stages, save))
 
     visual_context = []
     preview = folder / 'overview.mp4'
-    visual_enabled = bool(settings.get('visual_analysis', True)) and not bool(manual)
-    if visual_enabled:
+    visual_enabled = prepared is None and bool(settings.get('visual_analysis', True)) and not bool(manual)
+    # Stream windows are already chosen by viewer clips and chat; only candidates get the HD frame check.
+    if visual_enabled and offset is None:
         await upd(status='analyzing', progress=23, status_text='Обзор кадров по всему видео и звуковых пиков…')
         if not isinstance(video_url, Path):
             await _preview_source(video_url, preview)
@@ -1134,48 +1293,111 @@ async def _inspect_material(db, video_url, source_identity, duration, offset, jo
         clip_min = max(5, min(clip_max, int(settings.get('clip_len_min', 12))))
         moments = await editorial.select_moments(
             segments=segments, words=full_words, duration=duration, video_title=job.get('video_title') or 'Видео',
-            max_clips=max(6, wanted),
+            max_clips=wanted if prepared is not None else max(6, wanted),
             min_duration=clip_min,
             max_duration=clip_max,
             genre=settings.get('genre', 'auto'), audience=settings.get('audience', 'new'),
             preferences=preferences, banned=banned, highlights=highlights,
-            chat=chat, cache=stages, visual_context=visual_context, progress=save, context_line='', trend_mode=trend_mode)
-        threshold = max(81.25 if trend_mode else 0, float(settings.get('quality_threshold', 81.25)))
+            chat=chat, cache=stages, visual_context=visual_context, progress=save, context_line='', trend_mode=trend_mode,
+            **({'candidate_budget': wanted} if prepared is not None else {}))
+        threshold = float(settings.get('quality_threshold', 75))
         moments = [m for m in moments if float(m.get('quality_score') or 0) >= threshold]
 
     verified_sources = {}
     if visual_enabled and not manual:
-        checked = []
-        for moment in moments:
-            # Small gameplay props disappear in the low-resolution overview.
-            # Verify the actual HD episode; keep the download for rendering.
-            start, end = float(moment['start']), float(moment['end'])
-            identity = hashlib.sha256(f'{start:.5f}:{end:.5f}'.encode()).hexdigest()[:16]
-            detail_source = folder / f'verify_{identity}.mp4'
-            await upd(status='analyzing', status_text='Проверка действия и развязки в HD…')
-            if not detail_source.exists():
-                await download_segment(video_url, start, end, detail_source)
-            verdict = await visual_analysis.verify(detail_source, moment, folder, stages, save, vision, _run,
-                                                   transcript=segments, video_offset=start)
-            if verdict.get('verdict') == 'reject':
-                continue
-            moment['visual_verified'] = verdict.get('verdict') == 'accept' and verdict.get('complete_event') is True
-            moment['visual_reason'] = str(verdict.get('reason', ''))[:500]
-            # Visual-only discoveries must have a visible completed event.
-            if (moment.get('visual_only') or moment.get('requires_visual') or settings.get('genre') == 'game') and not moment['visual_verified']:
-                continue
-            checked.append(moment)
-            verified_sources[(start, end)] = detail_source
-        moments = checked
+        moments, verified_sources = await _verify_moments(
+            video_url, moments, segments, settings, folder, stages, save, vision, upd)
 
     return moments, full_words, banned, verified_sources, preview
 
 
+def _verification_path(folder, start, end):
+    identity = hashlib.sha256(f'{start:.5f}:{end:.5f}'.encode()).hexdigest()[:16]
+    return folder / f'verify_{identity}.mp4'
+
+
+async def _verify_moments(video_url, moments, segments, settings, folder, stages, save, vision, upd):
+    checked, verified_sources = [], {}
+    for moment in moments:
+        # Small gameplay props disappear in a low-resolution overview.
+        # Verify the actual HD episode; keep the download for rendering.
+        start, end = float(moment['start']), float(moment['end'])
+        detail_source = _verification_path(folder, start, end)
+        await upd(status='analyzing', status_text='Проверка действия и развязки в HD…')
+        if not detail_source.exists():
+            await download_segment(video_url, start, end, detail_source)
+        verdict = await visual_analysis.verify(detail_source, moment, folder, stages, save, vision, _run,
+                                               transcript=segments, video_offset=start)
+        if verdict.get('verdict') == 'reject':
+            continue
+        moment['visual_verified'] = verdict.get('verdict') == 'accept' and verdict.get('complete_event') is True
+        moment['visual_reason'] = str(verdict.get('reason', ''))[:500]
+        if (moment.get('visual_only') or moment.get('requires_visual') or settings.get('genre') == 'game') and not moment['visual_verified']:
+            continue
+        checked.append(moment)
+        verified_sources[(start, end)] = detail_source
+    return checked, verified_sources
+
+
+async def _inspect_stream(db, video_url, source, duration, job, settings, folder, analysis,
+                          persist, saver, chat, vision, upd):
+    if analysis.get('transcript_version') != 1:
+        await upd(status='transcribing', progress=8, status_text='Локальное распознавание речи по всему исходнику…')
+    words, segments = await _transcript(db, video_url, duration, analysis, persist, folder,
+                                        long_source=True, upd=upd, job=job)
+    source_identity = extract_video_id(video_url)
+    banned, highlights = await _source_markers(source_identity, duration, None, analysis, persist)
+    windows = stream_analysis.review_windows(source, duration, segments)
+    moments, excluded = [], list(banned)
+    policy = {field: settings.get(field) for field in
+              ('genre', 'audience', 'selection_preferences', 'clip_len_min', 'clip_len_max', 'quality_threshold')}
+    policy['title'] = job.get('video_title')
+    for index, (start, end) in enumerate(windows):
+        material_analysis = analysis.setdefault('stream_review', {}).setdefault(f'{start:.3f}-{end:.3f}', {})
+        material_analysis['sponsorblock'] = {
+            'banned': [(max(0, first - start), min(end, last) - start) for first, last in banned
+                       if first < end and last > start],
+            'highlights': [at - start for at in highlights if start <= at < end],
+        }
+        signature = hashlib.sha256(json.dumps([policy, material_analysis['sponsorblock']],
+                                              ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:20]
+        completed = material_analysis.get('completed') or {}
+        if completed.get('signature') == signature:
+            moments.extend(completed['moments'])
+            excluded.extend(completed['excluded'])
+            continue
+        material_stages = material_analysis.setdefault('stages', {})
+        local_words = [{**item, 'start': item['start'] - start, 'end': item['end'] - start} for item in words
+                       if start <= item['start'] < item['end'] <= end]
+        local_segments = [{**item, 'start': item['start'] - start, 'end': item['end'] - start} for item in segments
+                          if start <= item['start'] < item['end'] <= end]
+        await upd(status='analyzing', progress=16 + int(35 * index / len(windows)),
+                  status_text=f'Проверка участка {index + 1}/{len(windows)}…')
+
+        async def update_window(**fields):
+            fields.pop('progress', None)
+            fields['status_text'] = f'Участок {index + 1}/{len(windows)}: ' + fields['status_text']
+            await upd(**fields)
+
+        picks, _, local_excluded, _, _ = await _inspect_material(
+            db, video_url, source_identity, end - start, start, job, settings, None, 2, True,
+            folder, material_analysis, persist, material_stages, saver(material_stages), chat, vision,
+            update_window, prepared=(local_words, local_segments),
+        )
+        absolute_excluded = [(first + start, last + start) for first, last in local_excluded]
+        absolute_moments = [{**moment, 'start': moment['start'] + start, 'end': moment['end'] + start} for moment in picks]
+        material_analysis['completed'] = {'signature': signature, 'moments': absolute_moments, 'excluded': absolute_excluded}
+        await persist()
+        excluded.extend(absolute_excluded)
+        moments.extend(absolute_moments)
+    return moments, words, segments, _merge_intervals(excluded)
+
+
 def _source_windows(source, duration):
     windows = []
-    for window in (source.get("windows") or [])[:3]:
+    for window in (source.get("windows") or [])[:8]:
         start, end = float(window["start"]), float(window["end"])
-        if 0 <= start < end <= duration and 5 <= end - start <= 180 and not _in_banned(start, end, windows):
+        if 0 <= start < end <= duration and 5 <= end - start <= 300 and not _in_banned(start, end, windows):
             windows.append((start, end))
     return windows
 
@@ -1204,12 +1426,18 @@ async def process_job(db, job_id):
     job = await db.jobs.find_one({'id': job_id})
     if not job or job.get('status') == 'cancelled':
         return
+    previous_progress = job.get('progress') or 0
+    progress = previous_progress if 0 < previous_progress < 100 else 0
     async def check():
         current = await db.jobs.find_one({'id': job_id})
         if not current or current.get('status') == 'cancelled':
             raise asyncio.CancelledError()
     async def upd(**fields):
+        nonlocal progress
         await check()
+        if 'progress' in fields:
+            progress = max(progress, fields['progress'])
+            fields['progress'] = progress
         await db.jobs.update_one({'id': job_id}, {'$set': {**fields, 'updated_at': _now()}})
 
     profile = await db.profiles.find_one({'id': job['profile_id']})
@@ -1225,13 +1453,19 @@ async def process_job(db, job_id):
         duration = await asyncio.to_thread(_get_video_duration_sync, video_url)
     source = job.get('source_video') or {}
     trend_mode = bool(source and job.get('autopilot_attempt_id'))
-    windows = _source_windows(source, duration) if duration > 1800.5 and trend_mode and not manual else []
-    if duration <= 0 or duration > 1800.5 and not windows:
+    provider_limit = stream_analysis.AUTHOR_DURATION_LIMITS.get(source.get('provider'))
+    author_stream = trend_mode and source.get('author_stream') is True and not manual and provider_limit is not None
+    if author_stream and duration > provider_limit:
+        raise RuntimeError(f'Исходник {source["provider"]} длиннее допустимых {provider_limit // 3600} ч')
+    long_source = bool(author_stream and duration > 1800.5)
+    windows = _source_windows(source, duration) if duration > 1800.5 and trend_mode and not manual and not long_source else []
+    if duration <= 0 or duration > 1800.5 and not (long_source or windows):
         raise RuntimeError('Для исходника длиннее 30 минут нужны достоверные отметки времени для ограниченного анализа')
     await db.jobs.update_one({'id': job_id}, {'$set': {'video_duration': duration}})
-    keys = await groq_pool.get_key_status(db)
-    if not any(k.get('free_tier_confirmed') and k.get('status') != 'disabled' for k in keys):
-        raise NoGroqKeys('В пуле Groq подтвердите ключ бесплатного аккаунта. Платные сервисы отключены.')
+    if await needs_groq(db):
+        keys = await groq_pool.get_key_status(db)
+        if not any(k.get('free_tier_confirmed') and k.get('status') != 'disabled' for k in keys):
+            raise NoGroqKeys('Нет ИИ для анализа: добавь бесплатные ключи Groq (раздел «ИИ и распознавание»).')
 
     analysis_id = _analysis_id(video_url)
     folder = RAW_DIR / ('analysis_' + analysis_id)
@@ -1252,52 +1486,91 @@ async def process_job(db, job_id):
 
     async def chat(messages, temperature=0.2, max_tokens=1200):
         await check()
-        return await groq_chat_json(db, messages, temperature, max_tokens)
+        if not long_source:
+            return await groq_chat_json(db, messages, temperature, max_tokens)
+        purpose = messages[0]['content']
+        models = (GROQ_REVIEW_MODELS if purpose.startswith(('[EDITORIAL:CRITIC]', '[EDITORIAL:COMPARE]', 'Ты сравниваешь'))
+                  else GROQ_SCREEN_MODELS)
+        return await groq_chat_json(db, messages, temperature, max_tokens, models=models)
 
     async def vision(messages, temperature=0.1, max_tokens=700):
         await check()
         return await groq_chat_json(db, messages, temperature, max_tokens, models=['qwen/qwen3.8-27b'])
 
     save = saver(stages)
-    wanted = max(1, min(int(params.get('num_clips', 1)), 6))
+    wanted = max(1, min(int(params.get('num_clips', 1)), 10))
     moments, full_words, banned, verified_sources, temporary = [], [], [], {}, []
     material_sources = {}
-    for window in windows or [None]:
-        if window is None:
-            offset, material_duration = 0, duration
-            material, material_folder, material_analysis = video_url, folder, analysis
-        else:
-            offset, stop = window
-            material_duration = stop - offset
-            key = f'{offset:.3f}-{stop:.3f}'
-            material_folder = folder / ('window_' + key)
-            material_folder.mkdir(exist_ok=True)
-            material = material_folder / 'source.mp4'
-            if not material.exists():
-                await upd(status='downloading', status_text='Скачивание отмеченного окна исходника…')
-                await download_segment(video_url, offset, stop, material)
-            temporary.append(material)
-            material_analysis = analysis.setdefault('windows', {}).setdefault(key, {'stages': {}})
-        material_stages = material_analysis.setdefault('stages', {})
-        picks, spoken, excluded, hd, preview = await _inspect_material(
-            db, material, extract_video_id(video_url), material_duration, offset if window else None,
-            job, settings, manual, wanted, trend_mode, material_folder, material_analysis,
-            persist, material_stages, saver(material_stages), chat, vision, upd,
+    plan = job.get('clip_plan') or {}
+    resume_plan = long_source and plan.get('version') == 1
+    if resume_plan:
+        full_words, _ = await _transcript(db, video_url, duration, analysis, persist, folder, long_source=True)
+        moments, banned = plan['moments'], plan['banned']
+        material_sources = {(moment['start'], moment['end']): (video_url, 0) for moment in moments}
+        for start, end in material_sources:
+            path = _verification_path(folder, start, end)
+            if path.exists():
+                verified_sources[(start, end)] = path
+        temporary.extend(folder.glob('verify_*.mp4'))
+    elif long_source:
+        moments, full_words, stream_segments, banned = await _inspect_stream(
+            db, video_url, source, duration, job, settings, folder, analysis, persist, saver, chat, vision, upd,
         )
-        temporary.append(preview)
-        full_words.extend({**word, 'start': word['start'] + offset, 'end': word['end'] + offset} for word in spoken)
-        banned.extend((start + offset, end + offset) for start, end in excluded)
-        verified_sources.update({(start + offset, end + offset): path for (start, end), path in hd.items()})
-        for moment in picks:
-            shifted = {**moment, 'start': float(moment['start']) + offset, 'end': float(moment['end']) + offset}
-            material_sources[(shifted['start'], shifted['end'])] = (material, offset)
-            moments.append(shifted)
+        material_sources = {(moment['start'], moment['end']): (video_url, 0) for moment in moments}
+    else:
+        for window in windows or [None]:
+            if window is None:
+                offset, material_duration = 0, duration
+                material, material_folder, material_analysis = video_url, folder, analysis
+            else:
+                offset, stop = window
+                material_duration = stop - offset
+                key = f'{offset:.3f}-{stop:.3f}'
+                material_folder = folder / ('window_' + key)
+                material_folder.mkdir(exist_ok=True)
+                material = material_folder / 'source.mp4'
+                if not material.exists():
+                    await upd(status='downloading', status_text='Скачивание отмеченного окна исходника…')
+                    await download_segment(video_url, offset, stop, material, precise=False)
+                temporary.append(material)
+                material_analysis = analysis.setdefault('windows', {}).setdefault(key, {'stages': {}})
+            material_stages = material_analysis.setdefault('stages', {})
+            picks, spoken, excluded, hd, preview = await _inspect_material(
+                db, material, extract_video_id(video_url), material_duration, offset if window else None,
+                job, settings, manual, wanted, trend_mode, material_folder, material_analysis,
+                persist, material_stages, saver(material_stages), chat, vision, upd,
+            )
+            temporary.append(preview)
+            full_words.extend({**word, 'start': word['start'] + offset, 'end': word['end'] + offset} for word in spoken)
+            banned.extend((start + offset, end + offset) for start, end in excluded)
+            verified_sources.update({(start + offset, end + offset): path for (start, end), path in hd.items()})
+            for moment in picks:
+                shifted = {**moment, 'start': float(moment['start']) + offset, 'end': float(moment['end']) + offset}
+                material_sources[(shifted['start'], shifted['end'])] = (material, offset)
+                moments.append(shifted)
     full_words.sort(key=lambda word: word['start'])
-    if trend_mode:
+    if trend_mode and not resume_plan:
         recent = await db.clips.find({'job_id': {'$ne': job_id}}).sort('created_at', -1).to_list(200)
         moments = _dedup_stories(moments, full_words, recent)
-    if not manual:
+    if long_source and not resume_plan:
+        if settings.get('visual_analysis', True):
+            candidates = moments
+            moments, verified_sources = await _verify_moments(
+                video_url, candidates[:wanted * 2], stream_segments, settings, folder, stages, save, vision, upd,
+            )
+            if len(moments) < wanted and len(candidates) > wanted * 2:
+                reserve, sources = await _verify_moments(
+                    video_url, candidates[wanted * 2:], stream_segments, settings, folder, stages, save, vision, upd,
+                )
+                moments.extend(reserve)
+                verified_sources.update(sources)
+        else:
+            moments = [moment for moment in moments if not (moment.get('requires_visual') or moment.get('visual_only'))]
+        temporary.extend(folder.glob('verify_*.mp4'))
+    if not manual and not resume_plan:
         moments = await choose_final(moments, full_words, stages, save, chat, wanted)
+        if long_source:
+            await upd(clip_plan={'version': 1, 'moments': moments, 'banned': banned})
 
     clip_ids = list(job.get('clip_ids') or [])
     review = bool(settings.get('review_before_send', False))
@@ -1315,6 +1588,8 @@ async def process_job(db, job_id):
         if not (0 <= s < e <= duration + 0.1) or _in_banned(s, e, banned):
             raise RuntimeError('Проверка границ отвергла неверный интервал')
         label = f'Клип {i + 1}/{len(moments)}'
+        await upd(status='analyzing', status_text=label + ': подготовка подписи…')
+        copy = await publication_metadata(moment, full_words, stages, save, chat)
         await upd(status='downloading', progress=55 + int(35 * i / max(1, len(moments))), status_text=label + ': скачивание…')
         raw = verified_sources.get((s, e)) or folder / f'{clip_id}.mp4'
         if not raw.exists():
@@ -1330,8 +1605,14 @@ async def process_job(db, job_id):
             raise RuntimeError('Выбранный рекламный файл отсутствует. Замени его в профиле и повтори задачу.')
         ad_kind = ad.get('kind', 'video') if ad else None
         banner = ADS_DIR / ad['filename'] if ad_kind == 'banner' else None
+        title_banner = bool(live.get('title_banner', True)) and not manual
+        crop_x = float((manual or {}).get('crop_x', settings.get('crop_x', 0.5)))
+        await upd(status='rendering', status_text=label + ': оформление и субтитры…')
+        portrait = None
+        if not manual or crop_x == float(settings.get('crop_x', 0.5)):
+            portrait = await asyncio.to_thread(face_layout.detect, raw, e - s, title_banner=title_banner)
         loop = None
-        if (settings.get('retention_style') == 'split' and words and moment.get('genre') in {'story', 'education', 'humor', 'debate'}
+        if (not portrait and settings.get('retention_style') == 'split' and words and moment.get('genre') in {'story', 'education', 'humor', 'debate'}
                 and not moment.get('requires_visual') and not moment.get('visual_only')):
             loop_id = settings.get('retention_loop_id')
             asset = await db.ads.find_one({'id': loop_id, 'kind': 'loop'}) if loop_id else None
@@ -1342,16 +1623,20 @@ async def process_job(db, job_id):
             hook = any(stream.get('codec_type') == 'audio' for stream in (await _probe(raw)).get('streams', []))
         ass = folder / f'{clip_id}.ass'
         if words:
-            ass.write_text(build_ass(words, 'montserrat_italic', settings.get('glow_color', '#06B6D4'),
-                                     offset=s, split=bool(loop)), encoding='utf-8')
+            ass.write_text(build_ass(words, live.get('font', 'montserrat_italic'), live.get('glow_color', '#06B6D4'),
+                                     offset=s, split=bool(loop), style=subtitle_style(live), duration=e - s), encoding='utf-8')
         else:
             ass.unlink(missing_ok=True)
-        await upd(status='rendering', status_text=label + ': оформление и субтитры…')
         output = CLIPS_DIR / f'{clip_id}.mp4'
         pending = folder / f'{clip_id}_render.mp4'
-        effects = {'banner': banner, 'loop': loop, 'hook': hook, 'duration': e - s} if banner or loop or hook else {}
+        effects = {'banner': banner, 'loop': loop, 'hook': hook, 'duration': e - s,
+                   'banner_style': {'position': _banner_spot(live), 'scale': live.get('banner_scale', 0.67),
+                                    'mode': live.get('banner_mode', 'timed'), 'seconds': live.get('banner_seconds', 3.5)}
+                   } if banner or loop or hook else {}
+        if portrait:
+            effects['portrait'] = portrait
         await render_clip(raw, ass, pending, float(settings.get('saturation', 1.35)), settings.get('background', 'blur'),
-                          float((manual or {}).get('crop_x', settings.get('crop_x', 0.5))), **effects)
+                          crop_x, **effects)
         if trend_mode and words:
             streams = (await _probe(pending)).get('streams', [])
             if not any(stream.get('codec_type') == 'audio' for stream in streams):
@@ -1380,10 +1665,11 @@ async def process_job(db, job_id):
         title = str(moment.get('title') or job.get('video_title') or 'Клип')[:100]
         caption = (manual or {}).get('caption') or title + '\n\n' + ' '.join(tags)
         await upd(status='rendering', status_text=label + ': обложка и комплект для публикации…')
-        copy = await publication_metadata(moment, full_words, stages, save, chat)
-        package = await ready_pack.build_package(output, title=title, banner_text=None,
-            caption=copy['caption'], profile_name='', out_dir=CLIPS_DIR, clip_id=clip_id,
-            run=_run, fonts_dir=FONTS_DIR)
+        package = await ready_pack.build_package(output, title=title, banner_text=title if title_banner else None,
+            caption=copy['caption'], profile_name=(live.get('brand_label') or profile.get('name', '')) if title_banner else '',
+            out_dir=CLIPS_DIR, clip_id=clip_id, run=_run, fonts_dir=FONTS_DIR,
+            style={'accent': live.get('brand_color', '#22DDEB'), 'highlight': live.get('brand_highlight', '#BFF84F'),
+                   'panel': live.get('brand_panel', '#09101D')} if title_banner else None)
         caption = package['publication_caption']
         clip = {**moment, 'id': clip_id, 'job_id': job_id, 'profile_id': job['profile_id'],
                 'video_url': video_url, 'source_duration': duration, 'title': title,
@@ -1396,7 +1682,7 @@ async def process_job(db, job_id):
                 'source_provider': source.get('provider'), 'source_trend_score': source.get('trend_score'),
                 'source_views_per_hour': source.get('views_per_hour'), 'ai_selected': not bool(manual), 'warning': ' · '.join(warnings) or None,
                 'needs_review': review, 'sent_to_telegram': False, 'sent_to': [], 'delivery_errors': {},
-                'crop_x': float((manual or {}).get('crop_x', settings.get('crop_x', 0.5))), 'created_at': _now()}
+                'crop_x': crop_x, 'created_at': _now()}
         if package:
             clip.update(package)
             clip['filename'] = package['video_filename']
@@ -1412,9 +1698,10 @@ async def process_job(db, job_id):
             output.unlink(missing_ok=True)
         raw.unlink(missing_ok=True)
         ass.unlink(missing_ok=True)
-    await db.processed.update_one({'profile_id': profile['id'], 'video_id': extract_video_id(video_url)},
-        {'$set': {'profile_id': profile['id'], 'video_id': extract_video_id(video_url), 'job_id': job_id,
-                  'completed': True, 'created_at': _now()}}, upsert=True)
+    if not manual:
+        await db.processed.update_one({'profile_id': profile['id'], 'video_id': extract_video_id(video_url)},
+            {'$set': {'profile_id': profile['id'], 'video_id': extract_video_id(video_url), 'job_id': job_id,
+                      'completed': True, 'created_at': _now()}}, upsert=True)
     text = f'Готово: {len(clip_ids)} клипов. '
     text += 'Готово к публикации: видео, обложка и подпись.' if clip_ids else 'Сильный эпизод не найден; автопилот проверит следующий источник.'
     await upd(status='review' if review and clip_ids else 'done', progress=100, status_text=text, clip_ids=clip_ids)

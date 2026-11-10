@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link2, Twitch, X, Youtube } from "lucide-react";
+import { api } from "@/lib/api";
 
 const twitchPresets = [
   "Sasavot", "5opka", "rostislav_999", "rostikfacekid", "bratishkinoff", "strogo",
@@ -14,7 +15,7 @@ const sourceTypes = {
   twitch: {
     name: "Twitch", icon: Twitch, inputId: "twitch-channel-url-input", addId: "add-twitch-channel-btn",
     placeholder: "https://www.twitch.tv/канал",
-    description: "Каналы, из которых можно брать популярные русскоязычные клипы.",
+    description: "Записи стримов за последние часы: ищем места, где зрители делали клипы и взрывался чат.",
   },
 };
 const buttonClass = "ghost-btn rounded-md px-3 py-2 text-xs disabled:opacity-50";
@@ -97,6 +98,33 @@ function SourceList({ type, channels, onSave }) {
   </section>;
 }
 
+function StreamerHealth({ channels, blocked, onBlocked }) {
+  const [rows, setRows] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const check = async () => {
+    setBusy(true);
+    try { setRows((await api.post("/streamers/check", { channels })).data.streamers); }
+    catch { setRows([]); }
+    finally { setBusy(false); }
+  };
+  const status = (row) => row.status === "ok"
+    ? <span className="text-emerald-400">записей {row.vods} · по {row.avg_hours} ч · последняя {row.last_vod_hours} ч назад{row.live ? " · сейчас в эфире" : ""}</span>
+    : <span className="text-amber-400">{row.status === "no_vods" ? "записи скрыты — только клипы" : row.status === "missing" ? "канал не найден" : "не ответил"}</span>;
+  return <div className="space-y-2 text-xs" data-testid="streamer-health">
+    <button type="button" data-testid="check-streamers-btn" disabled={busy || !channels.length} onClick={check} className={buttonClass}>
+      {busy ? "Проверяю…" : "Проверить, у кого есть записи стримов"}
+    </button>
+    {rows && rows.map((row) => {
+      const allowed = !blocked.includes(row.login);
+      return <div key={row.login} className="flex items-center justify-between gap-2 border border-[var(--cf-border)] rounded-md px-3 py-2" data-testid={`streamer-row-${row.login}`}>
+        <div className="min-w-0"><b>{row.name || row.login}</b> <p>{status(row)}</p></div>
+        <label className="flex items-center gap-1 shrink-0"><input type="checkbox" data-testid={`streamer-allowed-${row.login}`} checked={allowed}
+          onChange={(e) => onBlocked(e.target.checked ? blocked.filter((x) => x !== row.login) : [...blocked, row.login])} />Можно нарезать</label>
+      </div>;
+    })}
+  </div>;
+}
+
 export default function ProfileSources({ profile, onSave }) {
   const [saving, setSaving] = useState(false);
   const twitchChannels = profile.twitch_channels || [];
@@ -115,8 +143,14 @@ export default function ProfileSources({ profile, onSave }) {
         <label className="flex items-center gap-2 text-xs">
           <input type="checkbox" data-testid="youtube-trending" checked={youtubeEnabled} disabled={saving}
             onChange={(event) => saveTrending("youtube_trending", event.target.checked)} />
-          Показывать свежие видео популярных русскоязычных авторов
+          Искать самые хайповые ролики YouTube за сегодня
         </label>
+        {youtubeEnabled && <label className="block text-xs text-[var(--cf-text-2)]">Что искать (каждый запрос с новой строки, пусто — стандартный набор)
+          <textarea data-testid="youtube-queries-input" rows={4} disabled={saving}
+            className="w-full mt-1 bg-[var(--cf-bg)] border border-[var(--cf-border)] rounded-md px-3 py-2 text-sm outline-none focus:border-[var(--cf-cyan)]"
+            defaultValue={(profile.settings?.youtube_queries || []).join("\n")} placeholder={"лучшие моменты со стрима\nугар со стрима\nреакция стримера"}
+            onBlur={(e) => onSave({ settings: { youtube_queries: e.target.value.split("\n").map((q) => q.trim()).filter(Boolean).slice(0, 20) } })} />
+        </label>}
       </div>
       <div className="space-y-3 min-w-0">
         <SourceList type="twitch" channels={twitchChannels} onSave={(channels) => onSave({ twitch_channels: channels })} />
@@ -124,8 +158,10 @@ export default function ProfileSources({ profile, onSave }) {
           <input type="checkbox" data-testid="twitch-trending" checked={twitchEnabled}
             disabled={saving || (!twitchChannels.length && !twitchEnabled)}
             onChange={(event) => saveTrending("twitch_trending", event.target.checked)} />
-          Искать популярные русскоязычные клипы Twitch
+          Вырезать лучшие моменты из записей стримов Twitch
         </label>
+        {twitchChannels.length > 0 && <StreamerHealth channels={twitchChannels} blocked={profile.settings?.blocked_streamers || []}
+          onBlocked={(list) => onSave({ settings: { blocked_streamers: list } })} />}
         {!twitchChannels.length && <p className="text-xs text-[var(--cf-text-2)]">Добавьте канал, чтобы включить поиск.</p>}
       </div>
     </div>

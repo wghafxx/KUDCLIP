@@ -95,6 +95,16 @@ class EditorialTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_discovery_returns_zero_without_padding(self):
         chat = Chat(discovery=lambda _: [])
         self.assertEqual(await self.run_selector(chat, max_clips=10), [])
+
+    async def test_bad_cached_discovery_retries_only_that_stage(self):
+        cache = {}
+        expected = await self.run_selector(Chat(), cache=cache)
+        discovery = next(key for key in cache if ':discover:' in key)
+        cache[discovery] = {'candidates': 'invalid'}
+        chat = Chat()
+        self.assertEqual(await self.run_selector(chat, cache=cache), expected)
+        self.assertEqual(len(chat.calls), 1)
+        self.assertIn('DISCOVER', chat.calls[0][0][0]['content'])
         self.assertEqual(len(chat.calls), 1)
 
     async def test_complete_coverage_including_end_of_long_transcript(self):
@@ -239,10 +249,10 @@ class EditorialTests(unittest.IsolatedAsyncioTestCase):
             await self.run_selector(failing_chat)
 
     async def test_oversized_exact_candidate_fails_explicitly(self):
-        segments = [{"start": i * 5, "end": i * 5 + 5, "text": chr(1072 + i) * 800 + "."} for i in range(4)]
-        chat = Chat(discovery=lambda _: [candidate("S000001", "S000004", "а" * 350, "г" * 350)])
+        segments = [{"start": i * 5, "end": i * 5 + 5, "text": chr(1072 + i) * 890 + "."} for i in range(5)]
+        chat = Chat(discovery=lambda _: [candidate("S000001", "S000005", "а" * 350, "д" * 350)])
         with self.assertRaises(EditorialInputTooLarge):
-            await self.run_selector(chat, segments=segments, duration=20, max_duration=30, preferences="")
+            await self.run_selector(chat, segments=segments, duration=25, max_duration=30, preferences="")
 
     async def test_valid_long_preferences_compact_without_losing_source_coverage(self):
         segments = [{"start": i * 10, "end": i * 10 + 10, "text": "я" * 150 + "."} for i in range(22)]

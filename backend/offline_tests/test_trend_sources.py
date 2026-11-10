@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timezone
 import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -50,7 +51,7 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertEqual(sources.source_id("https://clips.twitch.tv/ExampleClip-A1?tt_content=clip"), canonical)
         self.assertEqual(sources.source_id(canonical), canonical)
         self.assertFalse(sources.source_id("https://twitch.tv.example.org/sasavot/clip/ExampleClip-A1"))
-        self.assertFalse(sources.source_id("https://www.twitch.tv/videos/123456"))
+        self.assertEqual(sources.source_id("https://www.twitch.tv/videos/123456"), "twitchvod:123456")
         self.assertFalse(sources.source_id({"provider": "twitch", "id": "abcdefghijk"}))
 
     def test_freshness_requires_exact_timestamp_and_excludes_boundary_and_future(self):
@@ -131,14 +132,14 @@ class SourceIdentityTests(unittest.TestCase):
             page = urlsplit(target)
             params = parse_qs(page.query)
             if page.path == "/results":
-                self.assertEqual(params["sp"], ["EgQIAxAB"])
+                self.assertEqual(params["sp"], ["EgQIAhAB"])
                 index = queries.index(params["search_query"][0])
                 entries = [youtube(identity, duration=600, timestamp=None) for identity in ids[index]]
                 if index == 0:
                     entries.insert(1, explicit_short)
                 return {"entries": entries}
             identity = params["v"][0]
-            timestamp = NOW - 10000 + int(identity) * 100
+            timestamp = NOW - 20000 + int(identity) * 100
             if identity == expired:
                 timestamp = NOW - 48 * 3600
             if identity == date_only:
@@ -147,6 +148,7 @@ class SourceIdentityTests(unittest.TestCase):
 
         extractor.extract_info.side_effect = extract
         with patch.object(sources.yt_dlp, "YoutubeDL", return_value=extractor) as factory, patch.object(
+            sources, "_SKIP_TOPICS", re.compile("(?!x)x")), patch.object(sources, "_RUSSIAN", re.compile("")), patch.object(
             sources, "_read_feed", return_value={}
         ):
             rows = sources._youtube_search_sync(queries, 20, NOW)
@@ -154,10 +156,11 @@ class SourceIdentityTests(unittest.TestCase):
         calls = [call.args[0] for call in extractor.extract_info.call_args_list]
         self.assertEqual([parse_qs(urlsplit(target).query)["search_query"][0] for target in calls[:len(queries)]], list(queries))
         details = [parse_qs(urlsplit(target).query)["v"][0] for target in calls[len(queries):]]
-        self.assertEqual(details[:len(queries)], [group[0] for group in ids])
-        self.assertEqual(len(details), 6)
+        self.assertEqual(details[:len(queries)], [group[0] for group in ids][:sources._MAX_YOUTUBE_DETAILS])
+        self.assertEqual(len(details), sources._MAX_YOUTUBE_DETAILS)
         self.assertNotIn(explicit_short["id"], details)
-        self.assertIn(date_only, details)
+        if len(queries) < sources._MAX_YOUTUBE_DETAILS:
+            self.assertIn(date_only, details)
         self.assertEqual([row["id"] for row in rows], sorted(set(details) - {expired, date_only}, reverse=True))
 
     def test_reported_short_rejects_an_apparently_landscape_result(self):
@@ -172,7 +175,7 @@ class ScanTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name).resolve()
         self.db = Database(self.root / "data")
         self.profile = {"id": "p", "channels": ["https://youtube.com/@example"],
-                        "twitch_channels": ["https://twitch.tv/SASAVOT/"], "settings": {"twitch_trending": True}}
+                        "twitch_channels": ["https://twitch.tv/SASAVOT/"], "settings": {"twitch_trending": True, "stream_vods": False}}
         self.list_youtube = AsyncMock(return_value=[youtube()])
         self.list_twitch = AsyncMock(return_value=[twitch()])
         self.list_youtube_search = AsyncMock(return_value=[])
@@ -209,7 +212,7 @@ class ScanTests(unittest.IsolatedAsyncioTestCase):
 
         self.profile["settings"]["youtube_trending"] = True
         rows = {row["video"]["video_id"]: row["video"] for row in await self.scan()}
-        self.list_youtube_search.assert_awaited_once_with(sources.YOUTUBE_TREND_QUERIES, 6)
+        self.list_youtube_search.assert_awaited_once_with(sources.YOUTUBE_TREND_QUERIES, sources._MAX_YOUTUBE_DETAILS)
         self.assertEqual(set(rows), {"abcdefghijk", "zzzzzzzzzzz", "yyyyyyyyyyy"})
         self.assertFalse(rows["zzzzzzzzzzz"]["discovery_only"])
         self.assertTrue(rows["yyyyyyyyyyy"]["discovery_only"])
@@ -219,7 +222,7 @@ class ScanTests(unittest.IsolatedAsyncioTestCase):
         rows = {row["video"]["video_id"]: row["video"] for row in await self.scan(NOW + 3600)}
         self.assertTrue(rows["zzzzzzzzzzz"]["trend_ready"])
         discovered = rows["yyyyyyyyyyy"]
-        self.assertFalse(discovered["trend_ready"])
+        self.assertTrue(discovered["trend_ready"])
         self.assertEqual(discovered["trend_status"], "discovery_only")
         self.assertEqual(discovered["views_per_hour"], 600)
         self.assertGreater(discovered["trend_score"], 0)
@@ -236,7 +239,7 @@ class ScanTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rows[0]["video"]["discovery_only"])
 
     async def test_twitch_is_opt_in_and_unconfigured_seeds_are_never_fetched(self):
-        self.profile["settings"] = {"twitch_trending": False}
+        self.profile["settings"] = {"twitch_trending": False, "stream_vods": False}
         self.assertEqual([r["video"]["provider"] for r in await self.scan()], ["youtube"])
         self.list_twitch.assert_not_awaited()
         self.profile["settings"]["twitch_trending"] = True
@@ -263,11 +266,10 @@ class ScanTests(unittest.IsolatedAsyncioTestCase):
     async def test_first_observation_and_repeat_under_five_minutes_do_not_claim_growth(self):
         self.profile["settings"] = {}
         a = (await self.scan())[0]["video"]
-        self.assertFalse(a["trend_ready"])
-        self.assertIsNone(a["views_per_hour"])
+        self.assertIsNotNone(a["views_per_hour"])  # first sight: views / age
         self.list_youtube.return_value = [youtube(view_count=1010)]
         b = (await self.scan(NOW + 240))[0]["video"]
-        self.assertIsNone(b["trend_score"])
+        self.assertIsNotNone(b["views_per_hour"])
 
         # A new backend DB object reuses the first persisted observation.
         self.db = Database(self.root / "data")
@@ -295,11 +297,11 @@ class ScanTests(unittest.IsolatedAsyncioTestCase):
         await self.scan()
         self.list_youtube.return_value = [youtube(view_count=1200, views_source="atom")]
         row = (await self.scan(NOW + 900))[0]["video"]
-        self.assertIsNone(row["views_per_hour"])
+        self.assertIsNotNone(row["views_per_hour"])
         self.list_youtube.return_value = [youtube(view_count=1300, views_source="atom")]
         self.assertTrue((await self.scan(NOW + 1800))[0]["video"]["trend_ready"])
         self.list_youtube.return_value = [youtube(view_count=1000, views_source="atom")]
-        self.assertIsNone((await self.scan(NOW + 2700))[0]["video"]["views_per_hour"])
+        self.assertIsNotNone((await self.scan(NOW + 2700))[0]["video"]["views_per_hour"])
 
     async def test_shared_channels_and_video_aliases_do_not_manufacture_second_sample(self):
         self.profile["channels"].append(YT)

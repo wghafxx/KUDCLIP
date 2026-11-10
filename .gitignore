@@ -1,14 +1,21 @@
 # Dependencies and caches
 node_modules/
+.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 frontend/build/
 frontend/.cache/
 
+# Large assets (downloaded automatically)
+backend/models/whisper/small/model.bin
+
 # Personal data: never publish
 backend/data/*
-!backend/data/groq_keys.json
 backend/media/
 backend/work/
 work/
+
+# Secrets
+backend/.env

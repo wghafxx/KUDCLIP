@@ -1,5 +1,6 @@
 """Publish daily releases through the visible browser's upload forms."""
 import asyncio
+import random
 from contextlib import suppress
 import os
 from pathlib import Path
@@ -57,6 +58,63 @@ def validate_debug_address(value):
     except ValueError:
         raise PostingBlocked("Укажи локальный адрес запущенного профиля Octo, например http://127.0.0.1:9222") from None
     return value
+
+
+REAL_BROWSERS = {
+    "edge": (9333, ("Microsoft/Edge/Application/msedge.exe",)),
+    "chrome": (9334, ("Google/Chrome/Application/chrome.exe",)),
+}
+
+
+def _real_browser(browser):
+    roots = [Path(os.environ[name]) for name in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA") if os.environ.get(name)]
+    for root in roots:
+        for relative in REAL_BROWSERS[browser][1]:
+            if (root / relative).is_file():
+                return str(root / relative)
+    raise PostingBlocked("Браузер не найден. Установи Microsoft Edge или Google Chrome.")
+
+
+async def _human_pause(low=0.6, high=2.2):
+    await asyncio.sleep(random.uniform(low, high))
+
+
+async def _human_type(locator, text):
+    """Type like a person: focus, clear, then key-by-key with uneven delays."""
+    await locator.click()
+    await _human_pause(0.3, 0.9)
+    await locator.press("Control+A")
+    await locator.press("Delete")
+    for index, char in enumerate(text):
+        await locator.press_sequentially(char, delay=random.randint(25, 110))
+        if index and index % random.randint(18, 40) == 0:
+            await _human_pause(0.2, 0.9)
+
+
+async def _launch_real(browser, folder, port=None, proxy=""):
+    """A normal browser process (no automation flags) so Google allows sign-in; we attach over CDP."""
+    port = port or REAL_BROWSERS[browser][0]
+    endpoint = f"http://127.0.0.1:{port}"
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as client:
+            await client.get(endpoint + "/json/version")
+        return endpoint
+    except httpx.HTTPError:
+        pass
+    folder.mkdir(parents=True, exist_ok=True)
+    await asyncio.create_subprocess_exec(
+        _real_browser(browser), f"--remote-debugging-port={port}", f"--user-data-dir={folder}",
+        "--no-first-run", "--no-default-browser-check", *([f"--proxy-server={proxy}"] if proxy else []), "about:blank")
+    for _ in range(40):
+        await asyncio.sleep(.5)
+        try:
+            async with httpx.AsyncClient(timeout=1.5) as client:
+                await client.get(endpoint + "/json/version")
+            return endpoint
+        except httpx.HTTPError:
+            continue
+    raise PostingBlocked("Браузер не открыл порт управления. Закрой все окна этого профиля и повтори.")
 
 
 def _opera():
@@ -282,10 +340,11 @@ async def _youtube_upload(page, path, clip, account, checkpoint):
     await file_input.set_input_files(str(path), timeout=30_000)
     title = await _control(page, platform, dialog.locator("#title-textarea #textbox"),
                            message="В Studio не открылось название ролика.", seconds=90)
-    await title.fill(clip["title"][:100])
+    await _human_type(title, clip["title"][:100])
     description = await _control(page, platform, dialog.locator("#description-textarea #textbox"),
                                  message="В Studio не открылось описание ролика.")
-    await description.fill(clip["caption"][:5000])
+    await _human_pause()
+    await _human_type(description, clip["caption"][:5000])
     audience = dialog.locator('tp-yt-paper-radio-button[name^="VIDEO_MADE_FOR_KIDS_"]')
     if not any([await _marked(radio) for radio in await audience.all()]):
         raise PostingBlocked("YouTube не выбрал аудиторию. Укажи аудиторию по умолчанию в настройках канала.")
@@ -320,6 +379,7 @@ async def _youtube_upload(page, path, clip, account, checkpoint):
     success = page.get_by_text(YT_SUCCESS)
     if await _any_visible(success):
         raise PostingBlocked("В Studio уже открыто подтверждение публикации. Закрой его и повтори проверку.")
+    await _human_pause(1.5, 4)
     await checkpoint("publishing")
     await publish.click()
     confirmation = await _control(page, platform, success, seconds=90,
@@ -361,7 +421,8 @@ async def _tiktok_upload(page, path, clip, checkpoint, *, account=None):
                             frame.locator('[contenteditable="true"][role="textbox"]'),
                             frame.locator('div[contenteditable="true"]'), seconds=120,
                             message="В TikTok Studio не появилось поле подписи.")
-    await editor.fill(clip["caption"][:2200])
+    await _human_pause(2, 5)
+    await _human_type(editor, clip["caption"][:2200])
     public_label = re.compile(r"^(Everyone|Public|Для всех|Все|Общедоступное)$", re.I)
     visibility = await _control(page, platform, frame.locator(".tiktok-select-selector").filter(
         has_text=re.compile(r"Everyone|Public|Friends|Followers|Only you|Private|Для всех|Все|Друзья|Подписчики|Только вы|Только я", re.I)),
@@ -433,7 +494,7 @@ class BrowserSession:
         self.login_pages = {}
 
     async def close(self):
-        if self.context is not None and self.signature[0] != "octo":
+        if self.context is not None and self.signature[0] not in {"octo", *REAL_BROWSERS}:
             with suppress(Exception):
                 await self.context.close()
         if self.driver is not None:
@@ -444,7 +505,7 @@ class BrowserSession:
 
     async def _context(self, config):
         signature = (config["browser"], config["debug_address"])
-        if self.context is not None and self.signature == signature:
+        if self.context is not None and self.signature == signature + (config.get("proxy", ""),):
             return self.context
         await self.close()
         try:
@@ -454,15 +515,17 @@ class BrowserSession:
         try:
             self.driver = await async_playwright().start()
             browser, endpoint = signature
-            if browser == "octo":
+            if browser == "octo" or browser in REAL_BROWSERS:
+                if browser in REAL_BROWSERS:
+                    endpoint = await _launch_real(browser, self.folder / ("real_" + browser), config.get("port"), config.get("proxy", ""))
                 external = await self.driver.chromium.connect_over_cdp(validate_debug_address(endpoint), timeout=10_000)
                 if len(external.contexts) != 1:
-                    raise PostingBlocked("Octo должен предоставить один запущенный профиль.")
+                    raise PostingBlocked("Браузер должен предоставить один запущенный профиль.")
                 context = external.contexts[0]
             else:
-                options = {"channel": "msedge"} if browser == "edge" else {"executable_path": _opera()}
                 context = await self.driver.chromium.launch_persistent_context(
-                    str(self.folder / browser), headless=False, timeout=45_000, **options)
+                    str(self.folder / browser), headless=False, timeout=45_000, executable_path=_opera(),
+                    ignore_default_args=["--enable-automation"], args=["--disable-blink-features=AutomationControlled"])
         except asyncio.CancelledError:
             await self.close()
             raise
@@ -475,7 +538,7 @@ class BrowserSession:
         except Exception:
             await self.close()
             raise PostingBlocked("Не удалось открыть браузер. Проверь, что он установлен и профиль доступен.") from None
-        self.signature, self.context = signature, context
+        self.signature, self.context = signature + (config.get("proxy", ""),), context
         context.on("close", lambda *_: self._closed(context))
         return context
 

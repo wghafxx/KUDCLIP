@@ -9,6 +9,9 @@ import { api, API, FONT_OPTIONS, fontFamily } from "@/lib/api";
 import BrowserPostingPanel from "@/BrowserPostingPanel";
 import ProfileMediaPanel from "@/ProfileMediaPanel";
 import ProfileSources from "@/ProfileSources";
+import StyleSettings from "@/StyleSettings";
+import AiSettingsPanel from "@/AiSettingsPanel";
+import AuthorsPage from "@/AuthorsPage";
 
 const errText = (e, fallback) => {
   const d = e?.response?.data?.detail;
@@ -126,7 +129,7 @@ const AutopilotPanel = ({ config, onRun, busy, activeJobs, profiles }) => {
   const providers = [];
   if (dailyProfiles.some((item) => item.channels?.length)) providers.push("YouTube за последние 48 часов");
   if (dailyProfiles.some((item) => item.settings?.twitch_trending && item.twitch_channels?.length)) {
-    providers.push("Популярные русскоязычные клипы Twitch");
+    providers.push("Хайповые записи стримов и клипы Twitch");
   }
   return <section className="cf-card autopilot-panel p-6 md:p-8" data-testid="autopilot-panel">
     <div className="flex justify-between items-start gap-5 flex-wrap">
@@ -147,7 +150,7 @@ const AutopilotPanel = ({ config, onRun, busy, activeJobs, profiles }) => {
       <button data-testid="run-autopilot" onClick={onRun} disabled={preparing || !config} className="neon-btn rounded-lg px-5 py-3 text-sm flex items-center gap-2 disabled:opacity-50">{preparing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}{preparing ? "Готовится ролик…" : "Подготовить ролик сейчас"}</button>
     </div>
     <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-7 pt-5 border-t border-[var(--cf-border)] text-xs">
-      <div><p className="text-[var(--cf-text-2)]">Расписание</p><p className="mt-1 font-semibold">Каждый день в {schedule}</p></div>
+      <div><p className="text-[var(--cf-text-2)]">Расписание</p><p className="mt-1 font-semibold">{config?.continuous ? "Круглосуточно" : `Каждый день в ${schedule}`}</p></div>
       <div><p className="text-[var(--cf-text-2)]">{waitingTrend ? "Следующая проверка" : "Следующий запуск"}</p><p className="mt-1 font-semibold">
         {config?.enabled ? formatTimestamp(waitingTrend ? nextScan : config.next_run_at, config.time_zone) : "Автопилот на паузе"}
       </p></div>
@@ -174,46 +177,47 @@ const AutopilotPanel = ({ config, onRun, busy, activeJobs, profiles }) => {
 };
 
 const AutopilotSettings = ({ config, onUpdate }) => {
-  const [hour, setHour] = useState(config?.hour ?? 10);
-  const [minute, setMinute] = useState(config?.minute ?? 0);
-  const [enabled, setEnabled] = useState(config?.enabled !== false);
-  const [dailyTarget, setDailyTarget] = useState(config?.daily_target ?? 3);
+  const [form, setForm] = useState({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   useEffect(() => {
-    setHour(config?.hour ?? 10);
-    setMinute(config?.minute ?? 0);
-    setEnabled(config?.enabled !== false);
-    setDailyTarget(config?.daily_target ?? 3);
-  }, [config?.hour, config?.minute, config?.enabled, config?.daily_target]);
+    if (config) setForm({ enabled: config.enabled !== false, hour: config.hour, minute: config.minute, daily_target: config.daily_target,
+      max_source_videos: config.max_source_videos, continuous: config.continuous !== false, chat_analysis: config.chat_analysis !== false,
+      fresh_hours: config.fresh_hours, post_interval_minutes: config.post_interval_minutes });
+  }, [config]);
+  const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.type === "checkbox" ? e.target.checked : Number(e.target.value) }));
   const save = async (e) => {
     e.preventDefault();
     if (busy || !config) return;
     setBusy(true);
     setError("");
-    try { await onUpdate({ enabled, hour: Number(hour), minute: Number(minute), daily_target: Number(dailyTarget) }); }
+    try { await onUpdate(form); toast.success("Настройки автопилота сохранены"); }
     catch (err) { setError(errText(err, "Не удалось сохранить настройки автопилота")); }
     finally { setBusy(false); }
   };
-  return <form className="cf-card p-5 space-y-3" onSubmit={save}>
-    <h3 className="font-display font-semibold text-sm">Расписание автопилота</h3>
-    <fieldset className="space-y-3" disabled={busy || !config}>
-      <label className="flex gap-2 items-center text-xs">
-        <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />Готовить выпуски каждый день
-      </label>
-      <div className="flex gap-2 items-end flex-wrap">
-        <label className="text-xs">Час<input className={inputClass} type="number" min="0" max="23" required value={hour} onChange={(e) => setHour(e.target.value)} /></label>
-        <label className="text-xs">Минуты<input className={inputClass} type="number" min="0" max="59" required value={minute} onChange={(e) => setMinute(e.target.value)} /></label>
-        <label className="text-xs">Роликов в день
-          <select className={inputClass} data-testid="daily-target" value={dailyTarget} onChange={(e) => setDailyTarget(e.target.value)}>
-            <option value="1">До 1</option><option value="2">До 2</option><option value="3">До 3</option>
-          </select>
-        </label>
-        <button type="submit" className="ghost-btn rounded-md px-4 py-2 text-xs disabled:opacity-50">Сохранить настройки</button>
+  const num = (key, text, min, max, hint) => <label className="text-xs">{text}
+    <input data-testid={`autopilot-${key}`} className={inputClass} type="number" min={min} max={max} required value={form[key] ?? ""} onChange={set(key)} />
+    {hint && <span className="text-[10px] text-[var(--cf-text-2)]">{hint}</span>}
+  </label>;
+  return <form className="cf-card p-5 space-y-4" onSubmit={save} data-testid="autopilot-settings">
+    <h3 className="font-display font-semibold text-sm">Автопилот: поиск, нарезка и постинг</h3>
+    <fieldset className="space-y-4" disabled={busy || !config}>
+      <div className="flex flex-wrap gap-5 text-xs">
+        <label className="flex gap-2 items-center"><input type="checkbox" checked={!!form.enabled} onChange={set("enabled")} />Автопилот включён</label>
+        <label className="flex gap-2 items-center"><input data-testid="autopilot-continuous" type="checkbox" checked={!!form.continuous} onChange={set("continuous")} />Работать круглосуточно (не ждать времени запуска)</label>
+        <label className="flex gap-2 items-center"><input data-testid="autopilot-chat" type="checkbox" checked={!!form.chat_analysis} onChange={set("chat_analysis")} />Учитывать всплески чата</label>
       </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {num("daily_target", "Роликов в день", 1, 30, "до 30")}
+        {num("max_source_videos", "Стримов в день", 1, 15, "сколько записей разбирать")}
+        {num("fresh_hours", "Свежесть, часов", 6, 96, "стрим закончился не раньше")}
+        {num("post_interval_minutes", "Пауза между постами, мин", 15, 720, "для каждой площадки")}
+        {!form.continuous && num("hour", "Час запуска", 0, 23)}
+        {!form.continuous && num("minute", "Минуты", 0, 59)}
+      </div>
+      <button type="submit" data-testid="save-autopilot-btn" className="neon-btn rounded-md px-4 py-2 text-xs disabled:opacity-50">Сохранить</button>
     </fieldset>
-    {busy && <p className="text-xs text-[var(--cf-text-2)]" role="status">Сохраняется…</p>}
-    <p className="text-[10px] text-[var(--cf-text-2)]">Часовой пояс {config?.time_zone || "Asia/Qyzylorda"}</p>
+    <p className="text-[10px] text-[var(--cf-text-2)]">Часовой пояс {config?.time_zone || "Asia/Qyzylorda"}. Сначала берутся стримы с наибольшим числом клипов зрителей и просмотров в час.</p>
     {error && <p className="text-xs text-red-400" role="alert">{error}</p>}
   </form>;
 };
@@ -276,7 +280,7 @@ const GroqKeysPanel = () => {
         <button className="ghost-btn rounded p-1 ml-auto" onClick={load} title="Обновить использование квоты"><RefreshCw className="w-3.5 h-3.5" /></button>
       </div>
       <p className="text-[11px] text-[var(--cf-text-2)] mb-3">
-        Используются только ключи бесплатного аккаунта Groq, которые вы подтвердили. Тариф аккаунта проверяете вы; приложение не включает платные сервисы. При исчерпании квоты задачи ждут её восстановления.
+        При исчерпании квоты KudClip повторяет тот же запрос с другим доступным ключом. Если свободного лимита пока нет, задача продолжится с сохранённого этапа после сброса квоты.
       </p>
       <div className="flex gap-2">
         <input data-testid="groq-key-input" value={newKey} onChange={(e) => setNewKey(e.target.value)}
@@ -291,7 +295,7 @@ const GroqKeysPanel = () => {
         Использовать ключ бесплатного аккаунта Groq
       </label>
       <input className={inputClass} maxLength={100} value={scopeId} onChange={(e) => setScopeId(e.target.value)} placeholder="Группа квоты / организация (необязательно)" />
-      <p className="text-[10px] text-[var(--cf-text-2)] mt-1">Ключам одной организации укажите одинаковую группу: они могут делить лимит.</p>
+      <p className="text-[10px] text-[var(--cf-text-2)] mt-1">Укажите одинаковую группу для ключей с общей квотой Groq. Пустая группа означает отдельную квоту.</p>
       {error && <div role="alert" className="text-xs text-red-400 mt-2">{error} <button className="underline" onClick={load}>Повторить</button></div>}
       {keys.length > 0 && (
         <div className="mt-3 space-y-1.5">
@@ -483,14 +487,7 @@ const SettingsPanel = ({ profile, ads, onChange, onFlush, onAdsChanged, saveStat
           </select>
           {(s.background || "blur") === "crop" && <label className="block text-xs text-[var(--cf-text-2)] mt-2">Центр кадра: {Math.round((s.crop_x ?? 0.5) * 100)}%<input data-testid="crop-x-slider" className="w-full accent-[var(--cf-cyan)]" type="range" min="0" max="1" step="0.05" value={s.crop_x ?? 0.5} onChange={(e) => setS("crop_x", Number(e.target.value))} /></label>}
         </div>
-        <div>
-          <label className="text-xs text-[var(--cf-text-2)]">Цвет glow-свечения</label>
-          <div className="flex items-center gap-3 mt-1">
-            <input data-testid="glow-color-input" type="color" value={s.glow_color || "#06B6D4"}
-              onChange={(e) => setS("glow_color", e.target.value)} className="w-10 h-9 rounded-md" />
-            <span className="text-xs text-[var(--cf-text-2)]">{s.glow_color}</span>
-          </div>
-        </div>
+        <StyleSettings settings={s} onChange={(patch) => onChange(profile.id, { settings: patch })} />
         <div>
           <label className="text-xs text-[var(--cf-text-2)]">Насыщенность видео: {Number(s.saturation || 1.35).toFixed(2)}</label>
           <input data-testid="saturation-slider" type="range" min="1" max="1.8" step="0.05"
@@ -520,11 +517,6 @@ const SettingsPanel = ({ profile, ads, onChange, onFlush, onAdsChanged, saveStat
             value={s.auto_videos_count || 1} onChange={(e) => setS("auto_videos_count", parseInt(e.target.value))}
             className="w-full mt-2 accent-[var(--cf-cyan)]" />
         </div>
-      </div>
-      <div className="mt-4 rounded-md border border-[var(--cf-border)] bg-[var(--cf-bg)] p-4 flex items-center justify-center">
-        <span className="glow-text text-2xl font-black italic uppercase" style={{ fontFamily: fontFamily(), "--glow-color": s.glow_color }}>
-          Пример субтитров
-        </span>
       </div>
       <div className="mt-4 flex items-center gap-3">
         <button data-testid="save-settings-btn" onClick={() => onFlush(profile.id)} disabled={saveState?.status === "saving"} className="neon-btn rounded-md px-5 py-2 text-sm disabled:opacity-50">
@@ -836,12 +828,15 @@ export default function App() {
         <header className="pt-3 md:pt-6"><div className="flex items-center justify-between gap-4 mb-7"><div className="flex items-center gap-2.5"><img src="/logo.jpg" alt="" className="w-9 h-9 rounded-lg" /><span className="font-display font-extrabold text-sm tracking-wider">KUDCLIP</span></div><span className="text-[10px] text-emerald-400 border border-emerald-400/30 rounded-full px-3 py-1">Без платных сервисов</span></div><h1 className="font-display font-extrabold text-2xl md:text-4xl leading-tight">Готовые ролики каждый день</h1><p className="text-sm text-[var(--cf-text-2)] mt-4">Автоматический отбор, монтаж и публикация</p></header>
         {(initialLoading && !autopilot) && <div role="status" className="text-sm flex gap-2 items-center text-[var(--cf-text-2)]"><Loader2 className="w-4 h-4 animate-spin" />Подключаюсь к серверу…</div>}
         {(initialError || dataError) && <div role="alert" className="cf-card p-4 text-sm text-red-400">{dataError || initialError}<button data-testid="retry-connection" className="ghost-btn rounded px-3 py-1 ml-3" onClick={() => { loadInitial(); loadJobsClips(); }}>Повторить подключение</button></div>}
-        <AutopilotPanel config={autopilot} onRun={runAutopilot} busy={autopilotBusy} profiles={profiles}
-          activeJobs={jobs.filter((job) => !TERMINAL_JOBS.has(job.status))} />
-        <BrowserPostingPanel />
+        <AuthorsPage profiles={profiles} setProfiles={setProfiles} />
         <PublicationsGallery clips={clips} timeZone={autopilot?.time_zone} />
         <details data-testid="advanced-settings" className="border-t border-[var(--cf-border)] pt-5"><summary className="cursor-pointer text-sm text-[var(--cf-text-2)] flex items-center gap-2"><Settings2 className="w-4 h-4" />Настройки</summary><div className="space-y-4 mt-5">
-          <AutopilotSettings config={autopilot} onUpdate={updateAutopilot} />
+          <details className="cf-card p-5"><summary className="cursor-pointer text-sm font-semibold">Старый общий автопилот (работает, только если выключен ежедневный запуск авторов)</summary><div className="mt-4 space-y-4">
+            <AutopilotPanel config={autopilot} onRun={runAutopilot} busy={autopilotBusy} profiles={profiles}
+              activeJobs={jobs.filter((job) => !TERMINAL_JOBS.has(job.status))} />
+            <AutopilotSettings config={autopilot} onUpdate={updateAutopilot} />
+            <BrowserPostingPanel />
+          </div></details>
           {Object.entries(saveStates).filter(([id, state]) => state.status === "error" && profiles.some((item) => item.id === id)).map(([id, state]) => <div key={id} role="alert" className="cf-card p-3 text-xs text-red-400">Не сохранён профиль «{profiles.find((item) => item.id === id)?.name}»: {state.error} <button className="underline ml-2" onClick={() => flushProfile(id)}>Повторить</button></div>)}
           <ProfileManager profiles={profiles} activeId={activeId} onSelect={selectProfile} onCreate={createProfile} onDelete={deleteProfile} />
           {profile && <>
@@ -850,7 +845,8 @@ export default function App() {
               onFlush={flushProfile} onAdsChanged={loadAds} saveState={saveStates[profile.id]} />
           </>}
           <details className="cf-card p-5"><summary className="cursor-pointer text-sm font-semibold">Telegram — дополнительная доставка</summary><div className="mt-4"><TelegramPanel /></div></details>
-          <details className="cf-card p-5"><summary className="cursor-pointer text-sm font-semibold">Бесплатные AI-аккаунты</summary><div className="mt-4"><GroqKeysPanel /></div></details>
+          <details className="cf-card p-5" open><summary className="cursor-pointer text-sm font-semibold">ИИ и распознавание речи</summary><div className="mt-4"><AiSettingsPanel /></div></details>
+          <details className="cf-card p-5"><summary className="cursor-pointer text-sm font-semibold">Ключи бесплатных аккаунтов Groq</summary><div className="mt-4"><GroqKeysPanel /></div></details>
           <details className="cf-card p-5"><summary className="cursor-pointer text-sm font-semibold">История обработки</summary><div className="mt-4"><JobsPanel jobs={jobs} busy={jobBusy} onDelete={(id) => jobAction(id, "delete")} onCancel={(id) => jobAction(id, "cancel")} onRetry={(id) => jobAction(id, "retry")} /></div></details>
           <a className="text-xs text-[var(--cf-text-2)] underline inline-block" href={`${API}/source/archive`}>Скачать исходники приложения</a>
         </div></details>

@@ -354,7 +354,8 @@ def _compact_observations(observations, maximum=1000, description_limit=400, rea
 async def select_moments(*, segments, words, duration, video_title, max_clips,
                          min_duration, max_duration, genre="auto", audience="",
                          preferences="", banned=None, highlights=None, chat,
-                         cache=None, visual_context=None, progress=None, context_line="", trend_mode=False):
+                         cache=None, visual_context=None, progress=None, context_line="", trend_mode=False,
+                         candidate_budget=None):
     """Return 0..max_clips complete, evidenced stories, or propagate a stage error.
 
     Source IDs are stable for unchanged input. Speech hook/payoff have a
@@ -403,16 +404,22 @@ async def select_moments(*, segments, words, duration, video_title, max_clips,
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": _dump(payload)}]
         key = f"{VERSION}:{stage}:" + _digest({"source": source_signature, "messages": messages, "max_tokens": max_tokens})
-        if key in cache:
-            response = cache[key]
+        def valid(response):
             if not isinstance(response, dict):
-                raise ValueError("Повреждён сохранённый этап редакторского анализа")
-            return response
+                return False
+            if stage in ("discover", "discover_visual"):
+                return isinstance(response.get("candidates"), list)
+            if stage == "critic":
+                return response.get("verdict") in ("accept", "reject", "revise")
+            return isinstance(response.get("candidate_ids"), list)
+
+        if valid(cache.get(key)):
+            return cache[key]
         if _estimate(messages, max_tokens) > TOKEN_BUDGET:
             raise EditorialInputTooLarge(f"Этап {stage}: точный источник превышает бесплатный бюджет запроса; текст не обрезан")
         response = await chat(messages, temperature=0.15, max_tokens=max_tokens)
-        if not isinstance(response, dict):
-            raise ValueError(f"Этап {stage}: ожидался JSON-объект")
+        if not valid(response):
+            raise ValueError(f"Этап {stage}: ответ не соответствует формату; результат не сохранён")
         cache[key] = response
         if progress is not None:
             await progress(key, response)
@@ -533,7 +540,8 @@ async def select_moments(*, segments, words, duration, video_title, max_clips,
             pool = reduced
         return pool
 
-    proposals = await reduce_pool(proposals, min(12, max_clips * 3), "shortlist")
+    shortlist = min(12, max_clips * 3) if candidate_budget is None else max(max_clips, candidate_budget)
+    proposals = await reduce_pool(proposals, shortlist, "shortlist")
     critic_prompt = (
         "[EDITORIAL:CRITIC] Ты независимый строгий редактор. Оцени ТОЛЬКО точный candidate_source, "
         "внешний context не попадёт в клип. Speech evidence — цитаты речи; visual evidence — описания наблюдений, "

@@ -20,10 +20,9 @@ TWITCH_SEEDS = (
     "buster", "evelone192", "paradeev1ch", "t2x2", "voodoosh",
 )
 YOUTUBE_TREND_QUERIES = (
-    "Сасавот стрим лучшие моменты",
-    "Пятёрка 5opka моменты со стрима",
-    "Ростик rostislav_999 Dota 2 моменты со стрима",
-    "Фейскид rostikfacekid лучшие моменты стрима",
+    "шок", "угар", "приколы", "смешно до слёз", "жесть", "не поверишь", "реакция", "пранк",
+    "челлендж", "разоблачение", "скандал", "неожиданно", "вирусное видео", "тренды тик ток",
+    "эксперимент", "сломал", "купил", "24 часа",
 )
 FRESH_SECONDS = 48 * 3600
 MIN_OBSERVATION_GAP = 300
@@ -32,9 +31,15 @@ MIN_VIEWS_PER_HOUR = {"youtube": 200, "twitch": 30}
 MAX_SOURCE_SECONDS = 1800
 MAX_WINDOW_SECONDS = 180
 _LIST_LIMIT = {"youtube": 18, "twitch": 24}
-_MAX_YOUTUBE_DETAILS = 6
-_SEARCH_RESULTS_PER_QUERY = 4
-_YOUTUBE_RECENT_VIDEOS_FILTER = "EgQIAxAB"  # Upload Date: This week + Result Type: Video
+_MAX_YOUTUBE_DETAILS = 16
+_SEARCH_RESULTS_PER_QUERY = 10
+_YOUTUBE_RECENT_VIDEOS_FILTER = "EgQIAhAB"  # Upload Date: Today + Result Type: Video
+MIN_AGE_FOR_RATE = 1800
+_RUSSIAN = re.compile(r"[а-яё]", re.I)
+_SKIP_TOPICS = re.compile(r"official (?:music )?video|премьера клипа|премьера трека|lyrics|караоке|новости|выпуск новостей|"
+                          r"путин|госдума|минниханов|брифинг|лекция|урок|вебинар|проповедь|молитва|аудиокниг|"
+                          r"всу|сво\b|фронт|штурм|танк\b|войн|военн|украин|зеленск|сбу\b|мобилизац|дрон|обстрел|"
+                          r"[іїєґ]", re.I)
 _FEED_LIMIT = 1024 * 1024
 _OBSERVATION_ID = "view_counts"
 _OBSERVATION_LOCK = asyncio.Lock()
@@ -73,6 +78,8 @@ def _url_identity(value):
         return "twitch:" + slug if _TWITCH_SLUG.fullmatch(slug) else ""
     if parsed.hostname in _TWITCH_HOSTS and len(parts) == 3 and parts[1] == "clip":
         return "twitch:" + parts[2] if _TWITCH_SLUG.fullmatch(parts[2]) else ""
+    if parsed.hostname in _TWITCH_HOSTS and len(parts) == 2 and parts[0] == "videos" and parts[1].isdigit():
+        return "twitchvod:" + parts[1]
     if parsed.hostname == "youtu.be" and len(parts) == 1:
         identity = parts[0]
     elif parsed.hostname in _YT_HOSTS and parts == ["watch"]:
@@ -99,6 +106,8 @@ def source_id(value):
             return source_id(identity) if identity.startswith("twitch:") else ""
         value = value.get("video_id") or value.get("id") or ""
     value = str(value or "").strip()
+    if value.startswith("twitchvod:") and value[10:].isdigit():
+        return value
     if value.startswith("twitch:") and _TWITCH_SLUG.fullmatch(value[7:]):
         return value
     if value.startswith("youtube:"):
@@ -312,7 +321,7 @@ def _youtube_search_sync(queries, limit, now):
     with yt_dlp.YoutubeDL(_options(_SEARCH_RESULTS_PER_QUERY)) as ydl:
         for query in queries:
             try:
-                params = urlencode({"search_query": query, "sp": _YOUTUBE_RECENT_VIDEOS_FILTER})
+                params = urlencode({"search_query": query, "sp": _YOUTUBE_RECENT_VIDEOS_FILTER, "gl": "RU"})
                 data = ydl.extract_info(f"https://www.youtube.com/results?{params}", download=False)
                 if data is not None:
                     buckets.append(list(islice(data.get("entries") or (), _SEARCH_RESULTS_PER_QUERY)))
@@ -321,7 +330,11 @@ def _youtube_search_sync(queries, limit, now):
         if not buckets:
             raise SourceScanUnavailable("Публичный поиск YouTube сейчас недоступен.")
         remaining = limit
-        for batch in zip_longest(*buckets):
+        # Everything is from today, so raw views already rank the hype; open details only for the leaders.
+        flat_pool = [flat for batch in zip_longest(*buckets) for flat in batch
+                     if isinstance(flat, dict) and not _SKIP_TOPICS.search(str(flat.get("title") or ""))]
+        flat_pool.sort(key=lambda flat: -(_views(flat.get("view_count")) or 0))
+        for batch in [flat_pool]:
             for flat in batch:
                 if not isinstance(flat, dict) or _shorts_link(flat):
                     continue
@@ -350,7 +363,9 @@ def _youtube_search_sync(queries, limit, now):
                     if channel_id not in feed_cache:
                         feed_cache[channel_id] = _read_feed(channel_id)
                     _merge_feed_item(item, feed_cache[channel_id].get(identity))
-                if _confirmed_non_short(item) and fresh(item, now):
+                if (_confirmed_non_short(item) and fresh(item, now)
+                        and _RUSSIAN.search(str(detail.get("title") or ""))
+                        and not _SKIP_TOPICS.search(str(detail.get("title") or ""))):
                     result.append(item)
             if not remaining:
                 break
@@ -395,7 +410,7 @@ def _window(raw, duration, kind):
     return {"start": start, "end": min(end, start + MAX_WINDOW_SECONDS), "kind": kind, "title": title}
 
 
-def _windows(raw, duration):
+def youtube_signal_windows(raw, duration):
     selected = []
 
     def add(window):
@@ -447,7 +462,7 @@ def _candidate(raw, provider, channel, now):
         return None
     if provider == "twitch" and duration > MAX_SOURCE_SECONDS:
         return None
-    windows = _windows(raw, duration) if duration > MAX_SOURCE_SECONDS else []
+    windows = youtube_signal_windows(raw, duration) if duration > MAX_SOURCE_SECONDS else []
     if duration > MAX_SOURCE_SECONDS and not windows:
         return None
     url = ("https://clips.twitch.tv/" + identity[7:] if provider == "twitch"
@@ -480,12 +495,14 @@ def _sample(history, video, now):
         return history, None, None
     history = [item for item in history if item["source"] == current["source"]
                and now - item["at"] <= MAX_OBSERVATION_GAP]
+    age = now - (video.get("published_at") or now)
+    first_sight = video["views"] * 3600 / age if age >= MIN_AGE_FOR_RATE else None
     if not history or video["views"] < history[-1]["views"]:
-        return [current], None, None
+        return [current], first_sight, (now if first_sight is not None else None)
     if now - history[-1]["at"] >= MIN_OBSERVATION_GAP:
         history = [history[-1], current]
     if len(history) < 2:
-        return history, None, None
+        return history, first_sight, (now if first_sight is not None else None)
     first, last = history[-2:]
     rate = (last["views"] - first["views"]) * 3600 / (last["at"] - first["at"])
     return history, rate, last["at"]
@@ -533,7 +550,7 @@ async def scan_sources(db, profiles, now, *, list_youtube=None, list_twitch=None
         raise ValueError("Для поиска нужен точный момент времени с часовым поясом.")
     channels = defaultdict(set)
     youtube_owners = defaultdict(dict)
-    search_profiles = set()
+    search_profiles, custom_queries = set(), []
     for profile in profiles:
         profile_id = profile.get("id")
         if not profile_id:
@@ -544,13 +561,16 @@ async def scan_sources(db, profiles, now, *, list_youtube=None, list_twitch=None
                 youtube_owners[profile_id][_owner_key(channel)] = channel
         if (profile.get("settings") or {}).get("youtube_trending") is True:
             search_profiles.add(profile_id)
-        if (profile.get("settings") or {}).get("twitch_trending") is True:
+            custom_queries.extend((profile.get("settings") or {}).get("youtube_queries") or ())
+        # Twitch is handled by hype_scout (moments cut from full stream recordings).
+        if (profile.get("settings") or {}).get("twitch_trending") is True and (profile.get("settings") or {}).get("stream_vods") is False:
             for raw in profile.get("twitch_channels") or ():
                 if channel := _twitch_channel(raw):
                     channels[("twitch", channel)].add(profile_id)
     if not channels and not search_profiles:
         return []
     limit_concurrent = asyncio.Semaphore(3)
+    queries = tuple(dict.fromkeys(q.strip() for q in custom_queries if str(q).strip())) or YOUTUBE_TREND_QUERIES
 
     async def fetch(provider, channel):
         async with limit_concurrent:
@@ -568,8 +588,8 @@ async def scan_sources(db, profiles, now, *, list_youtube=None, list_twitch=None
         async with limit_concurrent:
             try:
                 if list_youtube_search:
-                    return await list_youtube_search(YOUTUBE_TREND_QUERIES, _MAX_YOUTUBE_DETAILS)
-                return await asyncio.to_thread(_youtube_search_sync, YOUTUBE_TREND_QUERIES, _MAX_YOUTUBE_DETAILS, now)
+                    return await list_youtube_search(queries, _MAX_YOUTUBE_DETAILS)
+                return await asyncio.to_thread(_youtube_search_sync, queries, _MAX_YOUTUBE_DETAILS, now)
             except Exception as error:
                 return error
 
@@ -624,7 +644,7 @@ async def scan_sources(db, profiles, now, *, list_youtube=None, list_twitch=None
             baseline = median(cohorts[(video["provider"], video["channel_url"])].values())
             score = round(50 * rate / (rate + floor) + 50 * rate / (rate + baseline), 3)
         status = "eligible" if qualified else ("collecting" if rate is None else "below_threshold")
-        video.update(trend_ready=qualified and not discovery_only, trend_score=score, views_per_hour=rate,
+        video.update(trend_ready=qualified, trend_score=score, views_per_hour=rate,
                      trend_observed_at=at, trend_status="discovery_only" if discovery_only else status)
     return sorted(rows.values(), key=lambda row: (row["video"].get("discovery_only", False),
                                                   not row["video"]["trend_ready"], -(row["video"]["trend_score"] or 0),

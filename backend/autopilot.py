@@ -8,11 +8,14 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from groq_pool import NoGroqKeys
-from trend_sources import fresh, scan_sources, source_id
+from trend_sources import fresh, scan_sources
+from hype_scout import scan_vods
+from source_history import excluded_source_ids
 
 DEFAULT_CONFIG = {
     "enabled": True, "hour": 10, "minute": 0, "time_zone": "Asia/Qyzylorda",
-    "daily_target": 3, "max_source_videos": 3, "config_version": 2,
+    "daily_target": 6, "max_source_videos": 4, "config_version": 2,
+    "continuous": True, "fresh_hours": 36, "post_interval_minutes": 90, "chat_analysis": True,
 }
 FINISHED = {"done", "exhausted", "skipped"}
 JOB_FINISHED = {"done", "review", "error", "cancelled"}
@@ -60,11 +63,15 @@ def _config(raw):
     result["time_zone"] = str(result["time_zone"])
     _tz(result["time_zone"])
     result["enabled"] = bool(result["enabled"])
-    result["daily_target"] = max(1, min(3, int(
+    result["daily_target"] = max(1, min(30, int(
         result["daily_target"] if raw.get("config_version") == 2 else DEFAULT_CONFIG["daily_target"]
     )))
     result["config_version"] = 2
-    result["max_source_videos"] = max(1, min(3, int(result["max_source_videos"])))
+    result["max_source_videos"] = max(1, min(15, int(result["max_source_videos"])))
+    result["continuous"] = bool(result["continuous"])
+    result["chat_analysis"] = bool(result["chat_analysis"])
+    result["fresh_hours"] = max(6, min(96, int(result["fresh_hours"])))
+    result["post_interval_minutes"] = max(15, min(720, int(result["post_interval_minutes"])))
     return result
 
 
@@ -171,7 +178,7 @@ class Autopilot:
         return None
 
     async def _ready_clips(self, job, run, limit):
-        threshold = _number(run.get("quality_threshold"), 81.25)
+        threshold = _number(run.get("quality_threshold"), 75)
         clips = await self.db.clips.find({"job_id": job["id"]}).to_list(None)
         ready = {clip["id"]: clip for clip in clips if clip.get("ready_for_publish") is True
                  and not clip.get("needs_review")
@@ -223,14 +230,12 @@ class Autopilot:
         await self._save(run)
         return False
 
-    async def _discover(self, run, profiles, runs, now):
-        jobs = await self.db.jobs.find({}).to_list(None)
-        processed = await self.db.processed.find({}).to_list(None)
-        excluded = {str(row.get("video_id")) for row in processed if row.get("completed")}
-        excluded |= {source_id(job.get("video_url", "")) for job in jobs
-                     if job.get("status") not in {"error", "cancelled"}}
-        excluded |= {attempt.get("video_id") for old in runs for attempt in old.get("attempts", [])
-                     if attempt.get("job_id") or attempt.get("charged")}
+    async def _discover(self, run, profiles, now, config=None):
+        config = config or DEFAULT_CONFIG
+        excluded = await excluded_source_ids(self.db)
+        # During this run, move on to a different candidate after a failure.
+        excluded.update(attempt.get("video_id") for attempt in run.get("attempts", [])
+                        if attempt.get("job_id") or attempt.get("charged"))
         source_config = [
             [profile["id"], profile.get("channels", []), profile.get("twitch_channels", []),
              (profile.get("settings") or {}).get("twitch_trending") is True,
@@ -238,24 +243,31 @@ class Autopilot:
             for profile in profiles
         ]
         if run.get("source_config") != source_config or now >= run.get("next_scan_at", 0):
+            pool, failures = [], 0
             try:
                 pool = await self.scan(self.db, profiles, now)
-            except Exception as exc:
-                raise _DiscoveryUnavailable(
-                    "Площадки не ответили на проверку источников. Повторим поиск позже."
-                ) from exc
+            except Exception:
+                failures += 1
+            try:
+                pool += await scan_vods(self.db, profiles, now, fresh_hours=config["fresh_hours"],
+                                        use_chat=config["chat_analysis"])
+            except Exception:
+                failures += 1
+            if failures == 2:
+                raise _DiscoveryUnavailable("Площадки не ответили на проверку источников. Повторим поиск позже.")
             warming = any(item["video"].get("trend_status") == "collecting" for item in pool)
             run.update(candidate_pool=pool, source_config=source_config,
-                       next_scan_at=self._now() + (900 if warming else 3600))
+                       next_scan_at=self._now() + (900 if warming else 1800))
             await self._save(run)
         valid_profiles = {profile["id"]: profile for profile in profiles}
         candidates = [item for item in run.get("candidate_pool", [])
-                      if item["profile_id"] in valid_profiles and fresh(item["video"], now)
+                      if item["profile_id"] in valid_profiles
+                      and (item["video"].get("source_kind") == "vod" or fresh(item["video"], now))
                       and item["video"]["video_id"] not in excluded
                       and item["video"].get("trend_ready") is True
                       and _number(item["video"].get("trend_score")) > 0]
-        candidates.sort(key=lambda item: (-item["video"]["trend_score"],
-                                           -item["video"]["views_per_hour"],
+        candidates.sort(key=lambda item: (item["video"].get("source_kind") != "vod", -item["video"]["trend_score"],
+                                           -(item["video"].get("views_per_hour") or 0),
                                            item["video"]["video_id"], item["profile_id"]))
         if candidates:
             best = candidates[0]
@@ -265,7 +277,7 @@ class Autopilot:
     async def _dispatch(self, run, attempt, profile, video, day):
         attempt.update(status="enqueuing", charged=True, charge_day=day)
         run.update(status="enqueuing", selected_profile_id=profile["id"],
-                   quality_threshold=max(81.25, _number((profile.get("settings") or {}).get("quality_threshold"), 81.25)))
+                   quality_threshold=_number((profile.get("settings") or {}).get("quality_threshold"), 75))
         await self._save(run)  # Reservation precedes the possibly interrupted callback.
         await self._counters(day)
         tagged = {**video, "autopilot_day": run["id"], "autopilot_attempt_id": attempt["id"],
@@ -293,6 +305,9 @@ class Autopilot:
         await self._save(run)
 
     async def _tick(self, force=False):
+        # The per-author evening run replaces the old global autopilot when it is on.
+        if ((await self.db.app_settings.find_one({"id": "main"})) or {}).get("author_daily", {}).get("enabled"):
+            return
         async with _RUN_LOCK:
             config, now = await self._get_config(), self._now()
             local = datetime.fromtimestamp(now, _tz(config["time_zone"]))
@@ -324,7 +339,7 @@ class Autopilot:
                 return
             if run and run.get("status") in {"exhausted", "skipped"}:
                 return
-            if not force and (not config["enabled"] or now < due):
+            if not force and (not config["enabled"] or (now < due and not config["continuous"])):
                 return
             if run is None:
                 run = {"id": day, "day": day, "status": "selecting", "started_at": now, "attempts": [], "last_error": ""}
@@ -356,15 +371,14 @@ class Autopilot:
                 run.update(status="exhausted", last_error="Дневной лимит источников достигнут; слабый клип не создаётся.")
                 await self._save(run)
                 return
-            all_runs = await self.db.autopilot_runs.find({}).to_list(None)
             try:
-                candidate = await self._discover(run, profiles, all_runs, now)
+                candidate = await self._discover(run, profiles, now, config)
             except _DiscoveryUnavailable as exc:
                 run.update(status="discovery_error", last_error=str(exc), retry_at=now + 60)
                 await self._save(run)
                 return
             if candidate is None:
-                run.update(status="waiting_trend", last_error="Ждём свежие русскоязычные источники с измеренным ростом.",
+                run.update(status="waiting_trend", last_error="Ждём новые записи стримов и хайповые клипы — проверка каждые 15–30 минут.",
                            retry_at=run.get("next_scan_at", now + 900))
                 await self._save(run)
                 return

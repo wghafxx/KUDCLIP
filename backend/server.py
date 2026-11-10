@@ -8,6 +8,8 @@ import time
 import asyncio
 import zipfile
 import logging
+import signal
+from contextlib import suppress
 from pathlib import Path
 from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Literal
@@ -20,11 +22,17 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 import pipeline
+import gpu_runtime
 from filedb import Database
 import groq_pool
+import ai_router
+import local_asr
+import hype_scout
+from author_daily import AuthorDaily
 from jobs import JobManager
 from autopilot import Autopilot
 from browser_posting import BrowserPosting, BrowserSession, PostingBlocked
+from source_history import excluded_source_ids
 
 data_dir = Path(os.environ.get('DATA_DIR') or ROOT_DIR / 'data')
 db = Database(data_dir)
@@ -36,9 +44,10 @@ enqueue_lock = asyncio.Lock()
 
 
 async def enqueue_daily(profile, video):
-    keys = await groq_pool.get_key_status(db)
-    if not any(k.get('free_tier_confirmed') and k.get('status') != 'disabled' for k in keys):
-        raise groq_pool.NoGroqKeys('Нет доступного ключа подтверждённого бесплатного аккаунта Groq')
+    if await pipeline.needs_groq(db):
+        keys = await groq_pool.get_key_status(db)
+        if not any(k.get('free_tier_confirmed') and k.get('status') != 'disabled' for k in keys):
+            raise groq_pool.NoGroqKeys('Нет ИИ для анализа: добавь бесплатные ключи Groq (раздел «ИИ и распознавание»)')
     return await _make_job(profile, video['url'], video['title'], video.get('thumbnail', ''),
                            video.get('duration') or 0, video['requested_clips'], 45, False,
                            autopilot_day=video.get('autopilot_day'),
@@ -47,20 +56,66 @@ async def enqueue_daily(profile, video):
 
 autopilot = Autopilot(db, enqueue_daily)
 browser_posting = BrowserPosting(db, pipeline.CLIPS_DIR, BrowserSession(data_dir / 'browser_profiles'))
+author_daily = AuthorDaily(db, enqueue_daily)
+author_posting = {}
+
+
+async def author_poster(profile_id):
+    """One isolated real-browser window (own profile folder and port) per author."""
+    if profile_id not in author_posting:
+        profiles = sorted(p['id'] for p in await db.profiles.find({}).to_list(None))
+        if profile_id not in profiles:
+            raise HTTPException(404, 'Автор не найден')
+        poster = BrowserPosting(db, pipeline.CLIPS_DIR, BrowserSession(data_dir / 'browser_profiles' / f'author_{profile_id}'),
+                                scope=profile_id, port=9400 + profiles.index(profile_id) % 500)
+        author_posting[profile_id] = poster
+        await poster.start()
+    return author_posting[profile_id]
+
+
+async def _thermal_shutdown(reason):
+    app.state.thermal_stop_reason = reason
+    logger.critical('%s. KudClip останавливается.', reason)
+    try:
+        await manager.stop(reason=reason)
+    finally:
+        request_shutdown = getattr(app.state, 'request_shutdown', None)
+        if request_shutdown is not None:
+            request_shutdown()
+        else:
+            signal.raise_signal(signal.SIGTERM)
 
 
 @app.on_event('startup')
 async def start_worker():
+    try:
+        await gpu_runtime.require_safe_temperature()
+    except gpu_runtime.ThermalStop as exc:
+        app.state.thermal_stop_reason = str(exc)
+        raise RuntimeError(f'{exc}. Запуск KudClip остановлен.') from None
     await manager.start()
     await autopilot.start()
     await browser_posting.start()
+    await author_daily.start()
+    for profile in await db.profiles.find({}).to_list(None):
+        if ((await db.app_settings.find_one({'id': 'main'})) or {}).get('author_posting', {}).get(profile['id']):
+            await author_poster(profile['id'])
+    app.state.thermal_monitor = asyncio.create_task(gpu_runtime.monitor(_thermal_shutdown))
 
 
 @app.on_event('shutdown')
 async def stop_worker():
-    await browser_posting.stop()
-    await autopilot.stop()
+    monitor = getattr(app.state, 'thermal_monitor', None)
+    if monitor is not None:
+        monitor.cancel()
+        with suppress(asyncio.CancelledError):
+            await monitor
     await manager.stop()
+    await browser_posting.stop()
+    await author_daily.stop()
+    for poster in author_posting.values():
+        await poster.stop()
+    await autopilot.stop()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -94,9 +149,29 @@ class ProfileSettings(BaseModel):
     selection_preferences: str = Field(default='', max_length=2000)
     review_before_send: bool = False
     visual_analysis: bool = True
-    quality_threshold: float = Field(default=81.25, ge=0, le=100)
+    quality_threshold: float = Field(default=75, ge=0, le=100)
     banner_enabled: bool = False
     daily_enabled: bool = True
+    sub_glow: bool = False
+    sub_size: int = Field(default=55, ge=40, le=140)
+    sub_color: str = Field(default="#FFFFFF", pattern=r"^#[0-9A-Fa-f]{6}$")
+    sub_position: Literal['bottom', 'middle', 'top'] = 'bottom'
+    sub_uppercase: bool = False
+    sub_words: int = Field(default=3, ge=1, le=6)
+    sub_animate: bool = False
+    sub_outline: int = Field(default=4, ge=0, le=12)
+    banner_position: Literal['top', 'middle', 'bottom'] = 'top'
+    banner_scale: float = Field(default=0.67, ge=0.3, le=1)
+    banner_mode: Literal['timed', 'always'] = 'timed'
+    banner_seconds: float = Field(default=3.5, ge=1, le=30)
+    stream_vods: bool = True
+    blocked_streamers: List[str] = []
+    youtube_queries: List[str] = Field(default_factory=list, max_length=20)
+    title_banner: bool = True
+    brand_label: str = Field(default="", max_length=48)
+    brand_color: str = Field(default="#22DDEB", pattern=r"^#[0-9A-Fa-f]{6}$")
+    brand_highlight: str = Field(default="#BFF84F", pattern=r"^#[0-9A-Fa-f]{6}$")
+    brand_panel: str = Field(default="#09101D", pattern=r"^#[0-9A-Fa-f]{6}$")
 
     @model_validator(mode='after')
     def duration_order(self):
@@ -239,6 +314,8 @@ async def add_groq_key(body: GroqKeyIn):
         'scope_id': body.scope_id.strip(),
     }
     await db.groq_keys.insert_one(dict(doc))
+    if body.free_tier_confirmed:
+        await manager.recheck_quota()
     doc.pop("key")
     return doc
 
@@ -266,13 +343,15 @@ async def update_groq_key(key_id: str, body: GroqKeyPatch):
     if body.free_tier_confirmed:
         fields['billing_blocked'] = False
     await db.groq_keys.update_one({'id': key_id}, {'$set': fields})
-    manager.notify()
+    await manager.recheck_quota()
     return next(k for k in await groq_pool.get_key_status(db) if k['id'] == key_id)
 
 
 @api_router.delete("/groq/keys/{key_id}")
 async def delete_groq_key(key_id: str):
-    await db.groq_keys.delete_one({"id": key_id})
+    result = await db.groq_keys.delete_one({"id": key_id})
+    if result.deleted_count:
+        await manager.recheck_quota()
     return {"ok": True}
 
 
@@ -478,7 +557,50 @@ class AutopilotSettings(BaseModel):
     enabled: Optional[bool] = None
     hour: Optional[int] = Field(default=None, ge=0, le=23)
     minute: Optional[int] = Field(default=None, ge=0, le=59)
-    daily_target: Optional[int] = Field(default=None, ge=1, le=3)
+    daily_target: Optional[int] = Field(default=None, ge=1, le=30)
+    max_source_videos: Optional[int] = Field(default=None, ge=1, le=15)
+    continuous: Optional[bool] = None
+    chat_analysis: Optional[bool] = None
+    fresh_hours: Optional[int] = Field(default=None, ge=6, le=96)
+    post_interval_minutes: Optional[int] = Field(default=None, ge=15, le=720)
+
+
+class AiSettings(BaseModel):
+    llm: Optional[Literal['auto', 'ollama', 'groq']] = None
+    asr: Optional[Literal['auto', 'local', 'groq']] = None
+    ollama_model: Optional[str] = Field(default=None, max_length=80)
+    whisper_model: Optional[Literal['large-v3-turbo', 'large-v3', 'medium', 'small']] = None
+
+
+async def _ai_status():
+    config = await ai_router.settings(db)
+    name, _ = await ai_router.provider(db)
+    keys = await groq_pool.get_key_status(db)
+    return {**config, 'active_llm': name, 'local_gpu': local_asr.available(), 'ollama_ready': await ai_router.ollama_ready(config),
+            'groq_keys': sum(1 for k in keys if k.get('free_tier_confirmed') and k.get('status') != 'disabled')}
+
+
+@api_router.get('/ai')
+async def ai_status():
+    return await _ai_status()
+
+
+@api_router.put('/ai')
+async def ai_update(body: AiSettings):
+    current = ((await db.app_settings.find_one({'id': 'main'})) or {}).get('ai') or {}
+    patch = body.model_dump(exclude_none=True)
+    await db.app_settings.update_one({'id': 'main'}, {'$set': {'ai': {**current, **patch}}}, upsert=True)
+    return await _ai_status()
+
+
+class StreamerCheck(BaseModel):
+    channels: List[str] = Field(default_factory=list, max_length=40)
+
+
+@api_router.post('/streamers/check')
+async def streamers_check(body: StreamerCheck):
+    logins = list(dict.fromkeys(login for c in body.channels if (login := hype_scout.login_of(c))))
+    return {'streamers': await hype_scout.check_streamers(logins)}
 
 
 @api_router.get('/autopilot')
@@ -509,7 +631,7 @@ PostingPlatform = Literal['youtube', 'tiktok']
 
 
 class BrowserPostingSettings(BaseModel):
-    browser: Literal['edge', 'opera', 'octo'] = 'edge'
+    browser: Literal['edge', 'chrome', 'opera', 'octo'] = 'edge'
     debug_address: str = Field(default='', max_length=200)
 
 
@@ -557,6 +679,82 @@ async def browser_posting_retry(platform: PostingPlatform):
 
 api_router.include_router(posting_router)
 
+authors_router = APIRouter(prefix='/authors', dependencies=[Depends(local_posting_panel)])
+
+
+class AuthorDailySettings(BaseModel):
+    enabled: Optional[bool] = None
+    hour: Optional[int] = Field(default=None, ge=0, le=23)
+    minute: Optional[int] = Field(default=None, ge=0, le=59)
+    fresh_hours: Optional[int] = Field(default=None, ge=6, le=96)
+    clips_per_source: Optional[int] = Field(default=None, ge=1, le=2)
+    youtube_clips: Optional[int] = Field(default=None, ge=4, le=8)
+    twitch_clips: Optional[int] = Field(default=None, ge=7, le=10)
+    post_interval_minutes: Optional[int] = Field(default=None, ge=20, le=720)
+    chat_analysis: Optional[bool] = None
+
+
+class AuthorProxy(BaseModel):
+    proxy: str = Field(default='', max_length=120, pattern=r'^((https?|socks5)://)?[\w.-]+:\d{2,5}$|^$')
+
+
+class AuthorRunOptions(BaseModel):
+    reserve_only: bool = False
+
+
+@authors_router.get('/schedule')
+async def authors_schedule():
+    return await author_daily.status()
+
+
+@authors_router.put('/schedule')
+async def authors_schedule_update(body: AuthorDailySettings):
+    return await author_daily.update(body.model_dump(exclude_none=True))
+
+
+@authors_router.post('/run')
+async def authors_run(body: Optional[AuthorRunOptions] = None):
+    return await author_daily.run_now(reserve_only=bool(body and body.reserve_only))
+
+
+@authors_router.get('/reports')
+async def authors_reports():
+    return {'days': await author_daily.reports()}
+
+
+@authors_router.get('/{profile_id}/posting')
+async def author_posting_status(profile_id: str):
+    return await (await author_poster(profile_id)).status()
+
+
+@authors_router.post('/{profile_id}/posting/{platform}/open')
+async def author_posting_open(profile_id: str, platform: PostingPlatform):
+    await posting_action((await author_poster(profile_id)).open(platform))
+    return {'ok': True}
+
+
+@authors_router.post('/{profile_id}/posting/{platform}/bind')
+async def author_posting_bind(profile_id: str, platform: PostingPlatform):
+    return await posting_action((await author_poster(profile_id)).bind(platform))
+
+
+@authors_router.put('/{profile_id}/posting/{platform}')
+async def author_posting_toggle(profile_id: str, platform: PostingPlatform, body: BrowserPostingToggle):
+    return await posting_action((await author_poster(profile_id)).enable(platform, body.enabled))
+
+
+@authors_router.post('/{profile_id}/posting/{platform}/retry')
+async def author_posting_retry(profile_id: str, platform: PostingPlatform):
+    return await posting_action((await author_poster(profile_id)).retry(platform))
+
+
+@authors_router.put('/{profile_id}/proxy')
+async def author_proxy(profile_id: str, body: AuthorProxy):
+    return await posting_action((await author_poster(profile_id)).set_proxy(body.proxy.strip()))
+
+
+api_router.include_router(authors_router)
+
 
 # ---------- Auto-start ----------
 async def _autostart_profile(profile: dict):
@@ -575,14 +773,7 @@ async def _autostart_profile(profile: dict):
         except Exception as e:
             errors.append(f"{ch}: {str(e)[:100]}")
 
-    processed = await db.processed.find({"profile_id": profile["id"]}).to_list(2000)
-    history = await db.jobs.find({'profile_id': profile['id']}).to_list(None)
-    # Legacy versions reserved processed before any work. Failed/cancelled
-    # attempts must not blacklist a video forever.
-    known = {pipeline.extract_video_id(j.get('video_url', '')) for j in history}
-    done_ids = {p['video_id'] for p in processed if p.get('completed') or p['video_id'] not in known}
-    done_ids |= {pipeline.extract_video_id(j.get('video_url', '')) for j in history
-                 if j.get('status') not in {'error', 'cancelled'}}
+    done_ids = await excluded_source_ids(db, profile["id"])
     by_id = {v['video_id']: v for v in all_videos}
     candidates = [v for v in by_id.values() if v['video_id'] not in done_ids and 30 <= (v.get('duration') or 0) <= 1800]
     candidates.sort(key=lambda v: v["views"], reverse=True)

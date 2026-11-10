@@ -7,4 +7,11 @@ httpx>=0.27.0
 yt-dlp[default]>=2026.08.19
 requests
 Pillow>=10
+opencv-python-headless>=4.10,<5
 playwright>=1.55,<2
+faster-whisper>=1.1
+# Faster Whisper 1.2.1 still passes the metadata_errors argument removed by PyAV 19.
+av>=11,<19
+nvidia-cublas-cu12; sys_platform == "win32"
+# 9.10 is the last cuDNN branch with GTX 10-series (Pascal) support.
+nvidia-cudnn-cu12==9.10.2.21; sys_platform == "win32"

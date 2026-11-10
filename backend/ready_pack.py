@@ -84,7 +84,18 @@ def _title_layout(text, font_path, width=880):
     raise ValueError("Заголовок слишком длинный для трёх читаемых строк")
 
 
-def _render_banner(text, profile_name, font_path, output):
+def _rgb(value, fallback):
+    value = str(value or "")
+    if re.fullmatch(r"#[0-9A-Fa-f]{6}", value):
+        return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+    return fallback
+
+
+def _render_banner(text, profile_name, font_path, output, style=None):
+    style = style or {}
+    accent = _rgb(style.get("accent"), (34, 221, 235))
+    highlight = _rgb(style.get("highlight"), (191, 248, 79))
+    panel = _rgb(style.get("panel"), (9, 16, 29))
     image = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     font, lines = _title_layout(text, font_path)
     line_height = int(font.size * 1.14)
@@ -93,18 +104,18 @@ def _render_banner(text, profile_name, font_path, output):
     ImageDraw.Draw(shadow).rounded_rectangle((42, 80, 1038, bottom + 12), radius=30, fill=(0, 0, 0, 150))
     image.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(14)))
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((48, 72, 1032, bottom), radius=26, fill=(9, 16, 29, 241))
-    draw.rounded_rectangle((48, 94, 56, bottom - 22), radius=4, fill=(34, 221, 235, 255))
+    draw.rounded_rectangle((48, 72, 1032, bottom), radius=26, fill=(*panel, 241))
+    draw.rounded_rectangle((48, 94, 56, bottom - 22), radius=4, fill=(*accent, 255))
     label = _text(profile_name).upper() or "МОМЕНТ ДНЯ"
     label = label[:48]
     label_font = ImageFont.truetype(str(font_path), 25)
     while draw.textlength(label, font=label_font) > 830 and label_font.size > 16:
         label_font = ImageFont.truetype(str(font_path), label_font.size - 1)
-    draw.text((94, 100), label, font=label_font, fill=(75, 224, 235, 255), anchor="lt")
-    draw.rounded_rectangle((952, 99, 984, 107), radius=4, fill=(191, 248, 79, 255))
+    draw.text((94, 100), label, font=label_font, fill=(*accent, 255), anchor="lt")
+    draw.rounded_rectangle((952, 99, 984, 107), radius=4, fill=(*highlight, 255))
     for index, line in enumerate(lines):
         draw.text((94, 145 + index * line_height), line, font=font,
-                  fill=(191, 248, 79, 255) if index == len(lines) - 1 else (250, 252, 255, 255),
+                  fill=(*highlight, 255) if index == len(lines) - 1 else (250, 252, 255, 255),
                   stroke_width=1, stroke_fill=(0, 0, 0, 180), anchor="lt")
     image.save(output, "PNG", optimize=True)
     return {"lines": lines, "font_size": font.size, "panel_bottom": bottom}
@@ -188,7 +199,7 @@ async def _encode(source, banner, output, run, bitrate=None):
 
 
 async def build_package(video_path, *, title, banner_text, caption, profile_name,
-                        out_dir, clip_id, run, fonts_dir, cover_at=None):
+                        out_dir, clip_id, run, fonts_dir, cover_at=None, style=None):
     """Build validated, idempotent local assets from the clean, unmodified clip.
 
     Outputs are separate ``*_ready.mp4`` / JPG / transparent PNG / text / ZIP.
@@ -202,10 +213,10 @@ async def build_package(video_path, *, title, banner_text, caption, profile_name
     lock = _LOCKS.setdefault((str(out_dir), str(clip_id)), asyncio.Lock())
     async with lock:
         return await _build(Path(video_path), title, banner_text, caption, profile_name,
-                            out_dir, str(clip_id), run, Path(fonts_dir), cover_at)
+                            out_dir, str(clip_id), run, Path(fonts_dir), cover_at, style)
 
 
-async def _build(source, title, supplied_banner, caption, profile_name, out_dir, clip_id, run, fonts_dir, cover_at=None):
+async def _build(source, title, supplied_banner, caption, profile_name, out_dir, clip_id, run, fonts_dir, cover_at=None, style=None):
     names = {"video_filename": f"{clip_id}_ready.mp4", "cover_filename": f"{clip_id}_cover.jpg",
              "package_filename": f"{clip_id}_publication.zip",
              "caption_filename": f"{clip_id}_caption.txt", "readme_filename": f"{clip_id}_README.txt"}
@@ -232,7 +243,8 @@ async def _build(source, title, supplied_banner, caption, profile_name, out_dir,
     publication_caption = str(caption or title or "Видео").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n").strip()
     signature_data = {"version": VERSION, "source_hash": _hash(source), "font_hash": _hash(font_path) if font_path else None,
                       "title": _text(title), "banner_text": visible_banner,
-                      "caption": publication_caption, "profile_name": _text(profile_name), 'cover_at': cover_at}
+                      "caption": publication_caption, "profile_name": _text(profile_name), 'cover_at': cover_at,
+                      **({"style": style} if style else {})}
     signature = hashlib.sha256(json.dumps(signature_data, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     result = {**names, "publication_caption": publication_caption, "banner_text": visible_banner,
               "ready_for_publish": True}
@@ -261,7 +273,7 @@ async def _build(source, title, supplied_banner, caption, profile_name, out_dir,
         banner = staging / names["banner_filename"] if include_banner else None
         cover = staging / names["cover_filename"]
         ready, frame = staging / names["video_filename"], staging / "source_frame.jpg"
-        layout = await asyncio.to_thread(_render_banner, visible_banner, profile_name, font_path, banner) if banner else None
+        layout = await asyncio.to_thread(_render_banner, visible_banner, profile_name, font_path, banner, style) if banner else None
         if cover_at is not None and (not math.isfinite(float(cover_at)) or float(cover_at) < 0):
             raise ValueError('Некорректный момент для обложки')
         at = max(0.0, min(float(cover_at) if cover_at is not None else source_info["duration"] * 0.4, source_info["duration"] - 0.05))

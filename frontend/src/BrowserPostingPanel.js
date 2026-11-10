@@ -129,7 +129,8 @@ export default function BrowserPostingPanel() {
       <label className="flex flex-col gap-1 text-xs">Браузер
         <select className={fieldClass} value={browser} disabled={busy || !state}
           onChange={(event) => setDraft({ browser: event.target.value, address })}>
-          <option value="edge">Microsoft Edge</option>
+          <option value="edge">Microsoft Edge (обычное окно — вход в Google работает)</option>
+          <option value="chrome">Google Chrome (обычное окно — вход в Google работает)</option>
           <option value="opera">Opera (если установлена)</option>
           <option value="octo">Открытый профиль Octo</option>
         </select>

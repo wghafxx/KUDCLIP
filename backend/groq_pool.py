@@ -60,6 +60,10 @@ _HEADER_RESOURCES = {
     "requests": "rpd", "tokens": "tpm",
     "audio-seconds-hour": "ash", "audio-seconds-day": "asd",
 }
+_BILLING_CODES = {"insufficient_credits", "insufficient_credit", "payment_required",
+                  "billing_hard_limit_reached", "blocked_api_access", "spend_limit_reached"}
+_BILLING_ERROR = "Groq сообщил об оплате/кредитах. Проверьте бесплатный тариф организации."
+_CYRILLIC_WORD = re.compile(r"[А-Яа-яЁё]{4,}")
 
 
 class GroqUnavailable(RuntimeError):
@@ -72,6 +76,15 @@ class NoGroqKeys(GroqUnavailable):
 
 class GroqModelUnavailable(GroqUnavailable):
     pass
+
+
+class GroqOutputLimit(GroqUnavailable):
+    """The request alone exceeds the organization's output-token ceiling."""
+
+    def __init__(self, limit, requested):
+        self.limit = int(limit)
+        self.requested = int(requested)
+        super().__init__(f"Groq: запрошено {self.requested} токенов ответа при лимите {self.limit}.")
 
 
 class GroqDeferred(GroqUnavailable):
@@ -158,15 +171,24 @@ def _clean_content(value):
 def estimate_tokens(json_body):
     """Planner estimate, including output reserve; actual usage replaces it later.
 
-    UTF-8 bytes / 2 + message overhead + max output + 2048 per image. Base64
-    image bytes are deliberately excluded. This is not a model tokenizer.
+    Use a conservative UTF-8 estimate with a small discount for contiguous
+    Cyrillic letters, plus framing, max output, and 2048 tokens per image.
+    Base64 image bytes are excluded. This is not a model tokenizer.
     """
     body = json_body or {}
     content = {k: body[k] for k in ("messages", "tools", "functions", "response_format") if k in body}
     clean, images = _clean_content(content)
-    byte_count = len(json.dumps(clean, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    maximum = max(_number(body.get("max_tokens")), _number(body.get("max_completion_tokens"))) or DEFAULT_MAX_TOKENS
-    return math.ceil(byte_count / 2) + 128 + 16 * len(body.get("messages") or []) + math.ceil(maximum) + images * 2048
+    serialized = json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
+    text_tokens = math.ceil(len(serialized.encode("utf-8")) / 2)
+    # The previous estimate counted each Cyrillic letter as a separate token.
+    # Preserve at least three tokens per four letters in longer Russian words.
+    text_tokens -= sum(len(word) // 4 for word in _CYRILLIC_WORD.findall(serialized))
+    return text_tokens + 128 + 16 * len(body.get("messages") or []) + _output_tokens(body) + images * 2048
+
+
+def _output_tokens(body):
+    maximum = max(_number(body.get("max_tokens")), _number(body.get("max_completion_tokens")))
+    return math.ceil(maximum) or DEFAULT_MAX_TOKENS
 
 
 def _prepare(path, data, json_body, audio_seconds):
@@ -191,17 +213,22 @@ def _prepare(path, data, json_body, audio_seconds):
     else:
         if not body.get("max_tokens") and not body.get("max_completion_tokens"):
             body["max_tokens"] = DEFAULT_MAX_TOKENS
-        cost = {"requests": 1, "audio_seconds": 0, "tokens": estimate_tokens(body)}
+        cost = {"requests": 1, "audio_seconds": 0, "tokens": estimate_tokens(body), "output_tokens": _output_tokens(body)}
     return model, body, cost
 
 
-async def _load_state(db, scope, model, now):
-    state = await db.groq_usage.find_one({"id": _state_id(scope, model)}) or {
+def _usage_state(scope, model, now, saved):
+    state = saved or {
         "id": _state_id(scope, model), "scope": scope, "model": model,
         "events": [], "blocks": {}, "provider": {}, "provider_limits": {},
     }
     state["events"] = [e for e in state.get("events", []) if _number(e.get("at")) > now - 86400]
     return state
+
+
+async def _load_state(db, scope, model, now):
+    saved = await db.groq_usage.find_one({"id": _state_id(scope, model)})
+    return _usage_state(scope, model, now, saved)
 
 
 async def _save_state(db, state):
@@ -215,6 +242,10 @@ def _cap(model, resource, state):
 
 
 def _availability(model, state, cost, now):
+    output_limit = _number(state.get("provider_output_limit"))
+    output_tokens = cost.get("output_tokens", 0)
+    if output_limit and output_tokens > output_limit:
+        raise GroqOutputLimit(output_limit, output_tokens)
     ready, reason = now, "Бесплатная квота Groq временно исчерпана."
     for resource, until in state.get("blocks", {}).items():
         if _number(until) > ready:
@@ -258,31 +289,46 @@ def _eligible(key):
             and key.get("enabled") is not False and bool(key.get("key")))
 
 
-async def _select(db, model, cost, excluded, now):
+async def _select(db, model, cost, excluded, rejected_scopes, now):
     keys = await db.groq_keys.find({}).to_list(500)
-    choices, waiting, oversized = [], [], []
+    saved = {row["scope"]: row for row in await db.groq_usage.find({"model": model}).to_list(None)}
+    scopes = {}
+    waiting, oversized = [], []
     for key in keys:
         if not _eligible(key):
             continue
         await _refresh_day(db, key, now)
-        state = await _load_state(db, _scope(key), model, now)
-        try:
-            at, reason = _availability(model, state, cost, now)
-        except GroqUnavailable as error:
-            oversized.append(error)
+        scope = _scope(key)
+        if scope not in scopes:
+            state = _usage_state(scope, model, now, saved.get(scope))
+            try:
+                at, reason = _availability(model, state, cost, now)
+            except GroqUnavailable as error:
+                oversized.append(error)
+                scopes[scope] = None
+            else:
+                scopes[scope] = state, at, reason
+        match = scopes[scope]
+        if match is None:
             continue
-        at = max(at, _key_pause(key, now))
+        state, at, reason = match
+        pause = _key_pause(key, now)
+        if pause > at:
+            at, reason = pause, "Ключ Groq временно приостановлен."
         if at > now:
             waiting.append((at, reason))
-        elif key["id"] not in excluded:
-            load = sum(_number(e.get("audio_seconds")) + _number(e.get("tokens")) / 100 for e in state["events"])
-            choices.append((load, str(key["id"]), key, state))
-    if choices:
-        _, _, key, state = min(choices, key=lambda item: (item[0], item[1]))
-        return key, state
+        elif key["id"] not in excluded and scope not in rejected_scopes:
+            # Keep later organizations unused until the earlier one cannot fit
+            # the request. Splitting small requests can fragment usable TPM.
+            return key, state
+    output_errors = [error for error in oversized if isinstance(error, GroqOutputLimit)]
+    if output_errors:
+        raise max(output_errors, key=lambda error: error.limit)
     if waiting:
         at, reason = min(waiting, key=lambda item: item[0])
         raise GroqDeferred(at, reason)
+    if rejected_scopes:
+        raise GroqDeferred(now + 1, "Groq: ожидается сброс лимита запросов.")
     if oversized:
         raise oversized[0]
     if any(k.get("free_tier_confirmed") is not True and not k.get("disabled") for k in keys):
@@ -303,7 +349,7 @@ async def _reserve(db, key, state, cost, now):
     return event
 
 
-def _update_headers(state, headers, model, now):
+def _update_headers(state, headers, model, now, reservation):
     for suffix, resource in _HEADER_RESOURCES.items():
         if resource not in FREE_LIMITS[model]:
             continue
@@ -318,14 +364,17 @@ def _update_headers(state, headers, model, now):
         reserve = math.ceil(min(limit or FREE_LIMITS[model][resource], FREE_LIMITS[model][resource]) * RESERVE_FRACTION)
         # A concurrently dispatched call might not yet be reflected in this
         # response's header. Keep all other in-flight reservations as well.
-        pending = sum(_number(e.get(_RESOURCES[resource][0])) for e in state.get("events", [])
-                      if e.get("status") == "reserved")
+        field, window = _RESOURCES[resource]
+        pending = sum(_number(e.get(field)) for e in state.get("events", [])
+                      if e.get("status") == "reserved" and e["at"] > now - window)
         remaining = max(0, _number(raw_remaining) - reserve - pending)
         old = state.setdefault("provider", {}).get(resource, {})
-        if old.get("reset_at", 0) > now:
+        # A new sequential response supersedes the estimate-decremented snapshot.
+        # An overlapping response may predate other reservations.
+        if old.get("reset_at", 0) > now and reservation["at"] < old.get("observed_at", now):
             remaining = min(remaining, old.get("remaining", remaining))
             reset = max(reset, old["reset_at"])
-        state["provider"][resource] = {"remaining": remaining, "reset_at": reset}
+        state["provider"][resource] = {"remaining": remaining, "reset_at": reset, "observed_at": now}
 
 
 def _rate_blocks(response, now):
@@ -351,15 +400,33 @@ def _rate_blocks(response, now):
     return {"rate_limit": now + (86400 if day_limit else 60)}
 
 
-def _error_kind(response):
-    text = response.text.lower()
+def _problem(response):
     try:
         error = response.json().get('error', {})
-        code = str(error.get('code') or error.get('type') or '').lower() if isinstance(error, dict) else ''
     except (ValueError, AttributeError):
-        code = ''
-    explicit_billing = code in {'insufficient_credits', 'insufficient_credit', 'payment_required',
-                                'billing_hard_limit_reached', 'blocked_api_access', 'spend_limit_reached'}
+        return {}
+    return error if isinstance(error, dict) else {}
+
+
+def _oversized_output(response, problem):
+    if response.status_code != 429:
+        return None
+    message = str(problem.get("message") or "").lower()
+    if "request too large" not in message or not re.search(r"\b(?:output tokens per minute|otpm)\b", message):
+        return None
+    values = re.search(r"\blimit\s*:?\s*([0-9]+(?:,[0-9]{3})*)\s*,?\s*requested\s*:?\s*([0-9]+(?:,[0-9]{3})*)",
+                       message)
+    if not values:
+        return None
+    limit, requested = (int(value.replace(",", "")) for value in values.groups())
+    return GroqOutputLimit(limit, requested) if 0 < limit < requested else None
+
+
+def _error_kind(response, code):
+    if response.status_code >= 500:
+        return "other"
+    text = response.text.lower()
+    explicit_billing = code in _BILLING_CODES
     # Groq's ordinary 429 messages may link to /settings/billing to advertise an
     # upgrade. Such a link is not a payment failure or a reason to disable Free.
     if response.status_code == 429 and not explicit_billing:
@@ -382,7 +449,7 @@ def _error_kind(response):
     return "other"
 
 
-async def _finish(db, key, model, reservation, response, now):
+async def _finish(db, key, model, reservation, response, now, output_error=None):
     state = await _load_state(db, _scope(key), model, now)
     event = next((e for e in state["events"] if e["id"] == reservation["id"]), None)
     old_tokens, old_audio = reservation["tokens"], reservation["audio_seconds"]
@@ -403,8 +470,15 @@ async def _finish(db, key, model, reservation, response, now):
                     event["audio_seconds"] = max(old_audio, math.ceil(_number(receipt["duration"])))
             except (ValueError, AttributeError, TypeError):
                 pass  # Missing/invalid receipt leaves the conservative reservation.
-    _update_headers(state, response.headers, model, now)
-    if response.status_code == 429:
+    if output_error:
+        previous = _number(state.get("provider_output_limit")) or output_error.limit
+        state["provider_output_limit"] = min(previous, output_error.limit)
+        snapshot = state.get("provider", {}).get("tpm", {})
+        if snapshot.get("reset_at", 0) > now and snapshot.get("observed_at", 0) <= reservation["at"]:
+            snapshot["remaining"] += old_tokens
+    else:
+        _update_headers(state, response.headers, model, now, reservation)
+    if response.status_code == 429 and not output_error:
         for resource, until in _rate_blocks(response, now).items():
             state.setdefault("blocks", {})[resource] = max(until, state.get("blocks", {}).get(resource, 0))
     await _save_state(db, state)
@@ -421,17 +495,24 @@ async def _finish(db, key, model, reservation, response, now):
 async def request(db, path, *, data=None, files=None, json_body=None, audio_seconds=0.0):
     """Return httpx.Response, or a typed failure; never sleep/retry blindly.
 
-    Independent confirmed free accounts may be selected after 429/invalid-key.
+    Independent confirmed free accounts may be selected after a definite rejection.
     Keys in a shared scope share reservations and cooldowns. A timeout/5xx is not
-    retried, since inference might already have consumed quota. Billing/credit
-    errors immediately stop this call and block the affected account's keys.
+    retried, since inference might already have consumed quota. A definitive
+    payment/credit rejection blocks only the affected quota group.
     """
     model, body, cost = _prepare(path, data, json_body, audio_seconds)
     attempted = set()
+    rejected_scopes = set()
+    billing_rejected = False
     while True:
         async with _LOCK:
             now = time.time()
-            key, state = await _select(db, model, cost, attempted, now)
+            try:
+                key, state = await _select(db, model, cost, attempted, rejected_scopes, now)
+            except NoGroqKeys:
+                if billing_rejected:
+                    raise GroqUnavailable(_BILLING_ERROR) from None
+                raise
             event = await _reserve(db, key, state, cost, now)
             attempted.add(key["id"])
         try:
@@ -443,31 +524,38 @@ async def request(db, path, *, data=None, files=None, json_body=None, audio_seco
                 )
         except httpx.HTTPError:
             raise GroqUnavailable("Groq: ошибка сети или тайм-аут; запрос не повторён, резерв квоты сохранён.") from None
+        problem = _problem(response) if response.status_code >= 300 else {}
+        output_error = _oversized_output(response, problem) if path == "/chat/completions" else None
         async with _LOCK:
-            await _finish(db, key, model, event, response, time.time())
+            await _finish(db, key, model, event, response, time.time(), output_error)
             if response.status_code < 300:
                 return response
-            try:
-                problem = response.json().get('error', {})
-                if isinstance(problem, dict):
-                    safe_message = re.sub(r'gsk_[A-Za-z0-9_-]+', '[key]', str(problem.get('message') or ''))[:700]
-                    safe_message = re.sub(r'org_[A-Za-z0-9_-]+', '[organization]', safe_message)
-                    await db.groq_usage.update_one({'id': state['id']}, {'$set': {'last_error': {
-                        'status': response.status_code, 'code': str(problem.get('code') or ''),
-                        'type': str(problem.get('type') or ''), 'message': safe_message}}})
-            except (ValueError, AttributeError):
-                pass
-            kind = _error_kind(response)
+            code = str(problem.get("code") or problem.get("type") or "").lower()
+            if problem:
+                details = {"status": response.status_code}
+                for field in ("code", "type", "message"):
+                    value = str(problem.get(field) or "").replace(key["key"], "[key]")
+                    value = re.sub(r'gsk_[A-Za-z0-9_-]+', '[key]', value)
+                    details[field] = re.sub(r'org_[A-Za-z0-9_-]+', '[organization]', value)[:700]
+                await db.groq_usage.update_one({"id": state["id"]}, {"$set": {"last_error": details}})
+            if output_error:
+                raise output_error
+            kind = _error_kind(response, code)
             if kind == "billing":
                 for account_key in await db.groq_keys.find({}).to_list(500):
-                    if _scope(account_key) == _scope(key):
+                    if account_key["id"] == key["id"] or _scope(account_key) == _scope(key):
                         await db.groq_keys.update_one({"id": account_key["id"]}, {"$set": {"billing_blocked": True}})
-                raise GroqUnavailable("Groq сообщил об оплате/кредитах. Запросы этого аккаунта остановлены; проверьте бесплатный тариф.")
+                if response.status_code == 402 or (400 <= response.status_code < 500 and code in _BILLING_CODES):
+                    billing_rejected = True
+                    continue
+                raise GroqUnavailable(_BILLING_ERROR)
             if kind == "auth":
                 await db.groq_keys.update_one({"id": key["id"]}, {"$set": {"disabled": True}})
             elif kind == "model":
                 raise GroqModelUnavailable("Groq: разрешённая модель недоступна или не разрешена для аккаунта.")
-            elif response.status_code != 429:
+            elif kind == "rate_limit":
+                rejected_scopes.add(_scope(key))
+            else:
                 raise GroqUnavailable(f"Groq отклонил запрос (HTTP {response.status_code}); автоматического повторения нет.")
 
 

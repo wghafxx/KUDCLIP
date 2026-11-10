@@ -116,7 +116,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clip['filename'], 'j_0_ready.mp4')
         self.assertEqual(clip['caption'], self.copy['caption'])
         self.assertNotIn('banner_filename', clip)
-        self.assertIsNone(self.package.await_args.kwargs['banner_text'])
+        self.assertEqual(self.package.await_args.kwargs['banner_text'], self.package.await_args.kwargs['title'])
         self.publication.assert_awaited_once()
         self.package.assert_awaited_once()
         self.assertEqual(self.select.await_args.kwargs['context_line'], '')
@@ -142,6 +142,123 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         calls = pipeline.download_segment.await_args_list
         self.assertEqual([call.args[1:3] for call in calls], [(400, 520), (1000, 1120), (10, 35), (10, 35)])
         self.assertTrue(all(isinstance(call.args[0], Path) for call in calls[-2:]))
+
+    async def test_long_author_twitch_analyzes_full_audio_and_downloads_only_final_cut(self):
+        url = 'https://www.twitch.tv/videos/123456789'
+        await self.job(video_url=url, video_duration=7 * 3600,
+                       source_video={'provider': 'twitch', 'author_stream': True},
+                       autopilot_attempt_id='author:sample:p:twitch')
+        shift = 7 * 3600 - 180
+        words = [{**word, 'start': word['start'] + shift, 'end': word['end'] + shift} for word in self.words]
+        segments = [{**line, 'start': line['start'] + shift, 'end': line['end'] + shift} for line in self.segments]
+        self.select.side_effect = [[], [self.moment]]
+        with patch.object(pipeline.stream_analysis, 'review_windows', return_value=[(0, 180), (shift, 7 * 3600)]), \
+             patch.object(pipeline, '_transcript', AsyncMock(return_value=(words, segments))) as transcribe, \
+             patch.object(pipeline, '_probe', AsyncMock(return_value={'streams': [{'codec_type': 'audio'}]})):
+            await pipeline.process_job(self.db, 'j')
+        transcribe.assert_awaited_once()
+        self.assertEqual(transcribe.await_args.args[1:3], (url, 7 * 3600))
+        self.assertIs(transcribe.await_args.kwargs['long_source'], True)
+        self.assertEqual([call.kwargs['max_clips'] for call in self.select.await_args_list], [2, 2])
+        self.assertEqual(self.select.await_args.kwargs['segments'], self.segments)
+        pipeline.download_segment.assert_awaited_once()
+        self.assertEqual(pipeline.download_segment.await_args.args[:3], (url, shift + 10, shift + 35))
+        clip = await self.db.clips.find_one({'id': 'j_0'})
+        self.assertEqual((clip['start'], clip['end']), (shift + 10, shift + 35))
+
+    async def test_author_youtube_rejects_more_than_three_hours_before_download(self):
+        await self.job(video_duration=3 * 3600 + 1,
+                       source_video={'provider': 'youtube', 'author_stream': True},
+                       autopilot_attempt_id='author:sample:p:youtube')
+        with self.assertRaisesRegex(RuntimeError, '3 ч'):
+            await pipeline.process_job(self.db, 'j')
+        pipeline.download_full_audio.assert_not_awaited()
+
+    async def test_long_transcription_reuses_saved_five_minute_parts(self):
+        video_url = 'https://youtu.be/abcdefghijk'
+        folder = self.raw / 'audio'
+        folder.mkdir()
+        analysis = {}
+        persist = AsyncMock()
+        first = self.transcribe.return_value
+        self.transcribe.side_effect = [first, RuntimeError('paused')]
+        with self.assertRaisesRegex(RuntimeError, 'paused'):
+            await pipeline._transcript(self.db, video_url, 601, analysis, persist, folder, long_source=True)
+        self.assertIn('0:300.000', analysis['transcript_parts'])
+        self.assertEqual(self.transcribe.await_args.args[2], 300)
+        self.transcribe.reset_mock(side_effect=True)
+        self.transcribe.side_effect = [first, ([], [], '')]
+        words, _ = await pipeline._transcript(self.db, video_url, 601, analysis, persist, folder, long_source=True)
+        self.assertEqual([call.args[2] for call in self.transcribe.await_args_list], [300, 1])
+        self.assertTrue(all(call.kwargs == {'local_only': True} for call in self.transcribe.await_args_list))
+        self.assertEqual(words[len(self.words)]['start'], 300)
+        self.assertEqual(analysis['transcript_parts'], {})
+        pipeline.download_full_audio.assert_awaited_once()
+        pipeline.visual_analysis.sound_peaks.assert_not_awaited()
+
+    async def test_stream_resume_keeps_windows_render_order_and_words(self):
+        shift = 1800
+        url = 'https://www.twitch.tv/videos/123456789'
+        await self.job(video_url=url, video_duration=shift + 180,
+                       source_video={'provider': 'twitch', 'author_stream': True},
+                       autopilot_attempt_id='author:sample:p:twitch')
+        words = self.words + [{'word': 'другое_' + w['word'], 'start': w['start'] + shift, 'end': w['end'] + shift}
+                              for w in self.words]
+        segments = self.segments + [{**s, 'start': s['start'] + shift, 'end': s['end'] + shift} for s in self.segments]
+        deferred = groq_pool.GroqDeferred(9999999999, 'offline quota')
+        self.select.side_effect = [[self.moment], deferred, [self.moment]]
+        self.publication.side_effect = [self.copy, deferred, self.copy]
+        with patch.object(pipeline.stream_analysis, 'review_windows', return_value=[(0, 180), (shift, shift + 180)]), \
+             patch.object(pipeline, '_transcript', AsyncMock(return_value=(words, segments))), \
+             patch.object(pipeline, '_probe', AsyncMock(return_value={'streams': [{'codec_type': 'audio'}]})):
+            with self.assertRaises(groq_pool.GroqDeferred):
+                await pipeline.process_job(self.db, 'j')
+            progress = (await self.db.jobs.find_one({'id': 'j'}))['progress']
+            with self.assertRaises(groq_pool.GroqDeferred):
+                await pipeline.process_job(self.db, 'j')
+            partial = await self.db.jobs.find_one({'id': 'j'})
+            self.assertGreaterEqual(partial['progress'], progress)
+            self.assertEqual(partial['clip_ids'], ['j_0'])
+            self.assertEqual([m['start'] for m in partial['clip_plan']['moments']], [10, shift + 10])
+            await pipeline.process_job(self.db, 'j')
+        self.assertEqual(self.select.await_count, 3)
+        self.assertEqual(self.render.await_count, 2)
+        clip = await self.db.clips.find_one({'id': 'j_1'})
+        self.assertEqual((clip['start'], clip['end']), (shift + 10, shift + 35))
+        self.assertEqual(clip['subtitle_text'].split()[0], 'другое_w10')
+
+    def test_subtitles_do_not_delay_fast_lines_and_stop_at_clip_end(self):
+        words = [{'word': 'Да!', 'start': 10.0, 'end': 10.08},
+                 {'word': 'Беги!', 'start': 10.08, 'end': 10.15},
+                 {'word': 'Ушёл.', 'start': 10.15, 'end': 10.24}]
+        ass = pipeline.build_ass(words, 'montserrat_italic', '#000000', offset=10.0, duration=0.24,
+                                 style={'animate': True})
+        lines = [line.split(',', 9) for line in ass.splitlines() if line.startswith('Dialogue: 1,')]
+        self.assertEqual([(line[1], line[2]) for line in lines],
+                         [('0:00:00.00', '0:00:00.08'), ('0:00:00.08', '0:00:00.15'), ('0:00:00.15', '0:00:00.24')])
+        self.assertEqual([line[-1].split('}')[-1] for line in lines], ['Да!', 'Беги!', 'Ушёл.'])
+        self.assertNotIn('\\fad', ass)
+
+    async def test_text_request_switches_models_without_changing_payload(self):
+        payload = [{'role': 'user', 'content': 'Сохрани точный фрагмент.'}]
+        paused = groq_pool.GroqDeferred(9999999999, 'model quota')
+        with patch.object(pipeline, 'groq_request', AsyncMock(side_effect=[paused, {
+                'choices': [{'message': {'content': '{"candidates": []}'}}]}])) as request:
+            reply = await pipeline._groq_chat_json(self.db, payload, max_tokens=700, models=pipeline.GROQ_SCREEN_MODELS)
+        self.assertEqual(reply, {'candidates': []})
+        self.assertEqual([call.kwargs['json_body']['model'] for call in request.await_args_list], list(pipeline.GROQ_SCREEN_MODELS[:2]))
+        self.assertTrue(all(call.kwargs['json_body']['messages'] == payload for call in request.await_args_list))
+
+    async def test_qwen_output_fits_its_limit_and_retries_same_prompt_for_smaller_cap(self):
+        messages = [{'role': 'user', 'content': 'Проверь этот участок.'}]
+        model = 'qwen/qwen3.8-27b'
+        with patch.object(pipeline, 'groq_request', AsyncMock(side_effect=[groq_pool.GroqOutputLimit(700, 900), {
+                'choices': [{'message': {'content': '{"candidates": []}'}}]}])) as request:
+            reply = await pipeline._groq_chat_json(self.db, messages, max_tokens=1200, models=[model])
+        self.assertEqual(reply, {'candidates': []})
+        sent = [call.kwargs['json_body'] for call in request.await_args_list]
+        self.assertEqual([item['max_tokens'] for item in sent], [900, 700])
+        self.assertEqual(sent[0], {**sent[1], 'max_tokens': 900})
 
     def test_trend_stories_skip_repeated_speech_across_sources(self):
         words = [{'word': token, 'start': index} for index, token in enumerate(

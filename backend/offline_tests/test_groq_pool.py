@@ -216,6 +216,38 @@ class GroqPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertTrue(self.calls[0].headers["authorization"].endswith("_b"))
 
+    async def test_local_tpm_exhaustion_skips_all_credentials_in_the_group(self):
+        first = await self.key(scope_id="first-org")
+        await self.key("b", scope_id="first-org")
+        await self.key("c", scope_id="second-org")
+        await self.seed(first, "openai/gpt-oss-20b", events=[self.event(tokens=6300)])
+        self.responses.append(self.success())
+        await self.chat()
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(self.calls[0].headers["authorization"].endswith("_c"))
+
+    async def test_first_added_key_stays_primary_while_it_has_capacity(self):
+        await self.key("first")
+        await self.key("backup")
+        self.responses.extend([self.success(tokens=2000), self.success(tokens=2000), self.success()])
+        await self.chat()
+        await self.chat()
+        await self.chat(max_tokens=2500)
+        self.assertEqual([call.headers["authorization"].split("_")[-1] for call in self.calls],
+                         ["first", "first", "backup"])
+
+    async def test_new_independent_key_is_available_before_old_tpm_reset(self):
+        first = await self.key()
+        await self.seed(first, "openai/gpt-oss-20b", events=[self.event(tokens=6300)])
+        with self.assertRaises(pool.GroqDeferred) as waiting:
+            await self.chat()
+        self.assertEqual(waiting.exception.retry_at, self.at + 60)
+        await self.key("b")
+        self.responses.append(self.success())
+        await self.chat()
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(self.calls[0].headers["authorization"].endswith("_b"))
+
     async def test_429_day_header_not_capped_to_six_hours(self):
         await self.key()
         self.responses.append(httpx.Response(429, json={"error": {"message": "rate limit"}}, headers={
@@ -252,6 +284,71 @@ class GroqPoolTests(unittest.IsolatedAsyncioTestCase):
             await self.chat()
         self.assertEqual(caught.exception.retry_at, self.at + 61)
         self.assertEqual(len(self.calls), 1)
+
+    async def test_provider_429_resends_same_request_only_in_independent_group(self):
+        await self.key(scope_id="shared")
+        await self.key("b", scope_id="shared")
+        await self.key("c", scope_id="independent")
+        self.responses.extend([
+            httpx.Response(429, headers={"retry-after": "35"}, json={"error": {"message": "TPM"}}),
+            self.success(),
+        ])
+        await self.chat()
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(self.calls[0].headers["authorization"].endswith("_a"))
+        self.assertTrue(self.calls[1].headers["authorization"].endswith("_c"))
+        self.assertEqual(self.calls[0].content, self.calls[1].content)
+
+    @staticmethod
+    def oversized_output_reply():
+        return httpx.Response(429, json={"error": {
+            "type": "tokens", "code": "rate_limit_exceeded",
+            "message": ("Request too large for model test on organization org_offline on service tier on_demand "
+                        "on output tokens per minute (OTPM): Limit 1,000, Requested 1,200. "
+                        "Please reduce your message size and try again."),
+        }}, headers={"retry-after": "60", "x-ratelimit-remaining-tokens": "0", "x-ratelimit-reset-tokens": "60s"})
+
+    async def test_oversized_output_429_is_remembered_without_minute_pause(self):
+        await self.key()
+        self.responses.append(self.oversized_output_reply())
+        with self.assertRaises(pool.GroqOutputLimit) as caught:
+            await self.chat(max_tokens=1200)
+        self.assertEqual((caught.exception.limit, caught.exception.requested), (1000, 1200))
+        self.assertEqual(self.db.groq_usage.docs[0]["blocks"], {})
+        self.assertEqual(self.db.groq_usage.docs[0]["events"][0]["tokens"], 0)
+        self.assertEqual(self.db.groq_usage.docs[0]["provider_output_limit"], 1000)
+        self.assertNotIn("org_offline", json.dumps(self.db.groq_usage.docs))
+        with self.assertRaises(pool.GroqOutputLimit):
+            await self.chat(max_tokens=1200)
+        self.assertEqual(len(self.calls), 1)
+        self.responses.append(self.success())
+        await self.chat(max_tokens=900)
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_learned_output_ceiling_applies_only_to_its_quota_group(self):
+        await self.key(scope_id="shared")
+        await self.key("b", scope_id="shared")
+        self.responses.append(self.oversized_output_reply())
+        with self.assertRaises(pool.GroqOutputLimit):
+            await self.chat(max_tokens=1200)
+        self.assertEqual(len(self.calls), 1)
+        await self.key("c", scope_id="independent")
+        self.responses.append(self.success())
+        await self.chat(max_tokens=1200)
+        self.assertTrue(self.calls[1].headers["authorization"].endswith("_c"))
+
+    async def test_ordinary_output_quota_429_still_rotates(self):
+        await self.key()
+        await self.key("b")
+        self.responses.extend([
+            httpx.Response(429, headers={"retry-after": "30"}, json={"error": {
+                "message": "Rate limit reached on output tokens per minute (OTPM): Limit 1000, Used 500, Requested 700."
+            }}),
+            self.success(),
+        ])
+        await self.chat(max_tokens=700)
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(self.calls[1].headers["authorization"].endswith("_b"))
 
     async def test_cooldown_is_per_model(self):
         await self.key()
@@ -293,6 +390,26 @@ class GroqPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.retry_at, self.at + 45)
         self.assertEqual(len(self.calls), 1)
 
+    async def test_new_sequential_header_replaces_stale_estimated_balance(self):
+        await self.key()
+
+        def reply(remaining, reset):
+            return httpx.Response(200, json={"usage": {"total_tokens": 17}}, headers={
+                "x-ratelimit-limit-tokens": "8000", "x-ratelimit-remaining-tokens": str(remaining),
+                "x-ratelimit-reset-tokens": reset,
+            })
+
+        self.responses.extend([reply(4400, "45s"), reply(5300, "20s"), self.success()])
+        await self.chat()
+        self.clock.return_value = self.at + 5
+        await self.chat(max_tokens=1800)
+        snapshot = self.db.groq_usage.docs[0]["provider"]["tpm"]
+        self.assertEqual(snapshot["remaining"], 3700)
+        self.assertEqual(snapshot["reset_at"], self.at + 25)
+        self.clock.return_value = self.at + 6
+        await self.chat(max_tokens=3000)
+        self.assertEqual(len(self.calls), 3)
+
     async def test_timeout_preserves_reservation_and_does_not_retry(self):
         await self.key()
         await self.key("b")
@@ -323,17 +440,34 @@ class GroqPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.db.groq_keys.docs[0].get("disabled", False))
         self.assertEqual(len(self.calls), 1)
 
-    async def test_billing_error_blocks_scope_and_stops_rotation(self):
+    async def test_definitive_billing_error_blocks_scope_and_rotates(self):
         await self.key(scope_id="same-org")
         await self.key("b", scope_id="same-org")
         await self.key("c")
-        self.responses.append(httpx.Response(402, json={"error": {"message": "Insufficient credits"}}))
-        with self.assertRaisesRegex(pool.GroqUnavailable, "оплате/кредитах"):
-            await self.chat()
-        self.assertEqual(len(self.calls), 1)
+        self.responses.extend([httpx.Response(402, json={"error": {"message": "Insufficient credits"}}), self.success()])
+        await self.chat()
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(self.calls[1].headers["authorization"].endswith("_c"))
         self.assertTrue(self.db.groq_keys.docs[0]["billing_blocked"])
         self.assertTrue(self.db.groq_keys.docs[1]["billing_blocked"])
         self.assertFalse(self.db.groq_keys.docs[2].get("billing_blocked", False))
+
+    async def test_exhausted_billing_pool_raises_clear_error(self):
+        await self.key()
+        self.responses.append(httpx.Response(400, json={"error": {"code": "insufficient_credits"}}))
+        with self.assertRaisesRegex(pool.GroqUnavailable, "оплате/кредитах"):
+            await self.chat()
+        self.assertTrue(self.db.groq_keys.docs[0]["billing_blocked"])
+
+    async def test_ambiguous_server_billing_text_does_not_rotate_or_disable(self):
+        await self.key()
+        await self.key("b")
+        self.responses.append(httpx.Response(503, json={"error": {"message": "Billing gateway unavailable"}}))
+        with self.assertRaisesRegex(pool.GroqUnavailable, "HTTP 503"):
+            await self.chat()
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(self.db.groq_keys.docs[0].get("billing_blocked", False))
+        self.assertEqual(self.db.groq_usage.docs[0]["events"][0]["status"], "uncertain")
 
     async def test_model_404_is_not_invalid_key(self):
         await self.key()

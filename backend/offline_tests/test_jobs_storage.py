@@ -27,7 +27,8 @@ sys.path.insert(0, str(BACKEND))
 
 import groq_pool
 from filedb import Database, DataStoreError
-from jobs import JobManager
+from jobs import JobManager, yield_to_quota_waiter
+from source_history import excluded_source_ids
 
 
 def isolated_functions(filename, names, namespace):
@@ -176,6 +177,60 @@ class JobManagerTests(_TemporaryDatabaseTests):
         self.assertEqual(quota["next_attempt_at"], deadline)
         self.assertEqual(called, ["quota", "ready"])
 
+    async def test_key_change_rechecks_persisted_quota_wait(self):
+        await self.job("quota", "waiting_quota", next_attempt_at=4102444800.0, progress=18)
+
+        async def process(db, job_id):
+            job = await db.jobs.find_one({"id": job_id})
+            self.assertEqual(job["progress"], 18)
+            await db.jobs.update_one({"id": job_id}, {"$set": {"status": "done"}})
+
+        manager = self.manager(process)
+        await manager.start()
+        await manager.recheck_quota()
+        await self.wait_status("quota", "done")
+
+    async def test_key_change_during_request_rechecks_the_same_job(self):
+        await self.job("quota")
+        waiting, allow_failure = asyncio.Event(), asyncio.Event()
+        called = []
+
+        async def process(db, job_id):
+            called.append(job_id)
+            if len(called) == 1:
+                waiting.set()
+                await allow_failure.wait()
+                raise groq_pool.GroqDeferred(4102444800.0, "offline quota")
+            await db.jobs.update_one({"id": job_id}, {"$set": {"status": "done"}})
+
+        manager = self.manager(process)
+        await manager.start()
+        await asyncio.wait_for(waiting.wait(), timeout=3)
+        await manager.recheck_quota()
+        allow_failure.set()
+        await self.wait_status("quota", "done")
+        self.assertEqual(called, ["quota", "quota"])
+
+    async def test_audio_checkpoint_yields_to_earlier_quota_job(self):
+        await self.job("older", "waiting_quota", "1", next_attempt_at=4102444800.0)
+        await self.job("audio", order="2")
+        calls = []
+
+        async def process(db, job_id):
+            calls.append(job_id)
+            job = await db.jobs.find_one({"id": job_id})
+            if job_id == "audio" and not job.get("saved_part"):
+                await db.jobs.update_one({"id": job_id}, {"$set": {"status": "transcribing", "saved_part": 1}})
+                await manager.recheck_quota()
+                await yield_to_quota_waiter(db, job)
+            await db.jobs.update_one({"id": job_id}, {"$set": {"status": "done"}})
+
+        manager = self.manager(process)
+        await manager.start()
+        job = await self.wait_status("audio", "done")
+        self.assertEqual(calls, ["audio", "older", "audio"])
+        self.assertEqual(job["saved_part"], 1)
+
     async def test_cancelling_active_job_stops_child_but_keeps_worker_alive(self):
         await self.job("active", order="1")
         await self.job("next", order="2")
@@ -294,6 +349,7 @@ class EnqueueTests(_TemporaryDatabaseTests):
             "HTTPException": HTTPException,
             "ProfileSettings": lambda: SimpleNamespace(model_dump=lambda: {"review_before_send": True}),
             "now_iso": lambda: datetime.now(timezone.utc).isoformat(),
+            "excluded_source_ids": excluded_source_ids,
         })
         self.profile = {"id": "profile", "name": "offline", "channels": ["https://youtube.invalid/channel"], "settings": {}}
         await self.db.profiles.insert_one(self.profile)
@@ -380,6 +436,21 @@ class EnqueueTests(_TemporaryDatabaseTests):
         result = await self.namespace["_autostart_profile"](self.profile)
         self.assertEqual(result["created"], 0)
         self.assertEqual(await self.db.jobs.find({}).to_list(None), [])
+
+    async def test_reset_unblocks_terminal_jobs_but_keeps_confirmed_publications(self):
+        for identity, status in (("abcdefghijk", "done"), ("bbbbbbbbbbb", "done"),
+                                 ("ccccccccccc", "waiting_quota"), ("ddddddddddd", "error")):
+            job = await self.make_job(f"https://youtu.be/{identity}")
+            await self.db.jobs.update_one({"id": job["id"]}, {"$set": {"status": status}})
+            if identity == "bbbbbbbbbbb":
+                await self.db.browser_posts.insert_one({"id": "youtube", "status": "published", "clip_id": job["id"] + "_0"})
+            if identity == "ddddddddddd":
+                await self.db.browser_posts.insert_one({"id": "tiktok", "status": "blocked", "clip_id": job["id"] + "_0"})
+        await self.db.processed.insert_one({"profile_id": "profile", "video_id": "abcdefghijk", "completed": True})
+        self.assertEqual(await excluded_source_ids(self.db, "profile"), {"abcdefghijk", "bbbbbbbbbbb", "ccccccccccc"})
+        await self.db.processed.delete_many({"completed": True})
+        self.assertEqual(await excluded_source_ids(self.db, "profile"), {"bbbbbbbbbbb", "ccccccccccc"})
+        self.assertEqual(await excluded_source_ids(self.db, "other"), set())
 
 
 class DeliveryTests(_TemporaryDatabaseTests):

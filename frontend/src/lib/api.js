@@ -7,6 +7,9 @@ export const api = axios.create({ baseURL: API, timeout: 120000 });
 
 export const FONT_OPTIONS = [
   { value: "montserrat_italic", label: "Montserrat Black Italic" },
+  { value: "montserrat", label: "Montserrat Black" },
+  { value: "rubik", label: "Rubik Black" },
+  { value: "russo", label: "Russo One" },
 ];
 
 export const fontFamily = () => "'Kudclip Montserrat', sans-serif";

@@ -6,15 +6,18 @@ import json
 import logging
 import math
 from pathlib import Path
+import random
 import re
 import time
 from urllib.parse import parse_qs, urlsplit
 
 from autopilot import DEFAULT_CONFIG, _tz
 from browser_upload import AD_DISCLOSURES, DISCLOSURE_REQUIRED, URLS, BrowserSession, PostingBlocked, validate_debug_address
+from trend_sources import source_id
 
 logger = logging.getLogger(__name__)
 POST_INTERVAL = 90 * 60
+_AUTHOR_SAVE = asyncio.Lock()
 VIEW_INTERVAL = 5 * 60
 VIEW_GRACE = 2 * 60 * 60
 VIEW_MILESTONES = {"24h": 24 * 3600, "48h": 48 * 3600}
@@ -84,7 +87,9 @@ def _supported_disclosure(platform, clip):
 
 
 class BrowserPosting:
-    def __init__(self, db, clips_dir, browser, *, now=time.time, view_reader=None):
+    def __init__(self, db, clips_dir, browser, *, now=time.time, view_reader=None, scope=None, port=None):
+        self.scope, self.port = scope, port
+        self.query = {"scope": scope} if scope else {}
         self.db = db
         self.clips_dir = Path(clips_dir).resolve()
         self.browser = browser
@@ -98,13 +103,34 @@ class BrowserPosting:
 
     async def _config(self):
         raw = await self.db.app_settings.find_one({"id": "main"}) or {}
-        saved = raw.get("browser_posting") or {}
+        saved = ((raw.get("author_posting") or {}).get(self.scope) if self.scope else raw.get("browser_posting")) or {}
+        if self.scope:
+            # Author windows always use a real browser; the global choice decides Edge or Chrome.
+            browser = (raw.get("browser_posting") or {}).get("browser", "chrome")
+            saved = {**saved, "browser": browser if browser in {"edge", "chrome"} else "chrome", "debug_address": ""}
         return {"browser": saved.get("browser", "edge"), "debug_address": saved.get("debug_address", ""),
-                "accounts": saved.get("accounts", {}), "enabled_since": saved.get("enabled_since", {})}
+                "accounts": saved.get("accounts", {}), "enabled_since": saved.get("enabled_since", {}),
+                "port": self.port, "proxy": saved.get("proxy", "")}
 
     async def _save_config(self, config):
-        await self.db.app_settings.update_one({"id": "main"}, {"$set": {"browser_posting": config}}, upsert=True)
+        if self.scope:
+            stored = {k: config.get(k) for k in ("accounts", "enabled_since", "proxy")}
+            async with _AUTHOR_SAVE:
+                raw = await self.db.app_settings.find_one({"id": "main"}) or {}
+                authors = {**(raw.get("author_posting") or {}), self.scope: stored}
+                await self.db.app_settings.update_one({"id": "main"}, {"$set": {"author_posting": authors}}, upsert=True)
+        else:
+            config = {k: v for k, v in config.items() if k not in {"port", "proxy"}}
+            await self.db.app_settings.update_one({"id": "main"}, {"$set": {"browser_posting": config}}, upsert=True)
         self.wake.set()
+
+    async def set_proxy(self, proxy):
+        async with self.config_lock:
+            config = await self._config()
+            config["proxy"] = proxy
+            await self._save_config(config)
+        await self.browser.close()
+        return await self.status()
 
     async def configure(self, browser, debug_address):
         address = validate_debug_address(debug_address.strip()) if browser == "octo" else ""
@@ -151,7 +177,7 @@ class BrowserPosting:
 
     async def status(self):
         config = await self._config()
-        records = await self.db.browser_posts.find({}).sort("updated_at", -1).to_list(12)
+        records = await self.db.browser_posts.find(dict(self.query)).sort("updated_at", -1).to_list(12)
         return {**config, "day": await self._day(), "posts": records}
 
     async def start(self):
@@ -191,6 +217,8 @@ class BrowserPosting:
         elif status == "published":
             record["published_at"] = now
         record.update(status=status, message=message, url=url, updated_at=now)
+        if self.scope:
+            record["scope"] = self.scope
         await self.db.browser_posts.update_one({"id": record["id"]}, {"$set": record}, upsert=True)
 
     async def _monitor_loop(self):
@@ -239,13 +267,21 @@ class BrowserPosting:
         return path
 
     async def _day(self):
+        if self.scope:
+            return datetime.fromtimestamp(self.now()).astimezone().date().isoformat()
         settings = await self.db.app_settings.find_one({"id": "main"}) or {}
         zone = (settings.get("autopilot") or {}).get("time_zone", DEFAULT_CONFIG["time_zone"])
         return datetime.fromtimestamp(self.now(), _tz(zone)).date().isoformat()
 
     async def _releases(self, day, enabled_at):
         by_clip = {}
-        for run in await self.db.autopilot_runs.find({}).to_list(None):
+        if self.scope:
+            for row in await self.db.author_days.find({"profile_id": self.scope}).to_list(None):
+                for item in row.get("releases") or []:
+                    # Evening runs finish after midnight; keep posting the last two days.
+                    if _timestamp(item.get("ready_at")) > self.now() - 48 * 3600:
+                        by_clip[item["clip_id"]] = (_timestamp(item["ready_at"]), item.get("day") or day)
+        for run in ([] if self.scope else await self.db.autopilot_runs.find({}).to_list(None)):
             releases = run.get("releases")
             entries = list(releases) if isinstance(releases, list) else []
             if run.get("status") == "done":
@@ -261,6 +297,10 @@ class BrowserPosting:
                 # fields. Preserve its original readiness for enable gating.
                 by_clip[clip_id] = min(ready_at, by_clip.get(clip_id, ready_at))
         now = self.now()
+        if self.scope:
+            return [{"day": item_day, "clip_id": clip_id, "ready_at": ready_at}
+                    for clip_id, (ready_at, item_day) in sorted(by_clip.items(), key=lambda item: (item[1][0], item[0]))
+                    if enabled_at < ready_at <= now]
         return [{"day": day, "clip_id": clip_id, "ready_at": ready_at}
                 for clip_id, ready_at in sorted(by_clip.items(), key=lambda item: (item[1], item[0]))
                 if enabled_at < ready_at <= now]
@@ -269,14 +309,19 @@ class BrowserPosting:
         enabled_at, account = config["enabled_since"].get(platform), config["accounts"].get(platform)
         if enabled_at is None or not account:
             return None
-        history = await self.db.browser_posts.find({"platform": platform}).to_list(None)
+        history = await self.db.browser_posts.find({"platform": platform, **self.query}).to_list(None)
         if not retry:
+            settings = await self.db.app_settings.find_one({"id": "main"}) or {}
+            source = settings.get("author_daily" if self.scope else "autopilot") or {}
+            interval = 60 * float(source.get("post_interval_minutes") or POST_INTERVAL / 60)
+            # Random spacing so posts never land on an exact robotic schedule.
+            interval *= 0.8 + 0.4 * random.Random(f"{self.scope}:{platform}:{len(history)}").random()
             last_attempt = max((
                 _timestamp(row.get("published_at")) or _timestamp(row.get("last_attempt_at"))
                 or _timestamp(row.get("updated_at"))
                 for row in history if row.get("status") in NON_REPEATABLE
             ), default=0)
-            if last_attempt and self.now() < last_attempt + POST_INTERVAL:
+            if last_attempt and self.now() < last_attempt + interval:
                 return None
         by_id = {row["id"]: row for row in history}
         sent_or_uncertain = {row.get("clip_id") for row in history if row.get("status") in NON_REPEATABLE}
@@ -310,7 +355,7 @@ class BrowserPosting:
         async with self.browser_lock:
             # A restarted worker cannot know whether an interrupted browser
             # action reached the platform. Recover even after midnight or pause.
-            for record in await self.db.browser_posts.find({}).to_list(None):
+            for record in await self.db.browser_posts.find(dict(self.query)).to_list(None):
                 if record.get("status") in UNCERTAIN_STAGES:
                     await self._store(record, "needs_review", "Отправка прервалась. Проверь площадку перед повторной загрузкой.")
             for platform in URLS:
@@ -324,7 +369,8 @@ class BrowserPosting:
         release, key, old, clip = candidate
         account = config["accounts"][platform]
         record = {**(old or {}), **release, "id": old["id"] if old else key, "platform": platform,
-                  "account": account, "title": str(clip.get("title") or "Клип")[:100]}
+                  "account": account, "title": str(clip.get("title") or "Клип")[:100],
+                  "profile_id": clip.get("profile_id"), "source_id": source_id(clip.get("video_url"))}
         disclosure = _supported_disclosure(platform, clip) if _is_ad(clip) else ""
         if _is_ad(clip) and not disclosure:
             record["retry_allowed"] = False
@@ -348,6 +394,10 @@ class BrowserPosting:
             path = self._file(clip)
             caption = str(clip.get("publication_caption") or clip.get("caption") or record["title"])
             payload = {"title": record["title"], "caption": caption}
+            texts = (clip.get("platform_texts") or {}).get(platform)
+            if isinstance(texts, dict):
+                payload = {"title": str(texts.get("title") or payload["title"])[:100],
+                           "caption": str(texts.get("caption") or caption)}
             if disclosure:
                 payload["ad_disclosure"] = disclosure
             url = await self.browser.publish(platform, config, path, payload, account, checkpoint)
